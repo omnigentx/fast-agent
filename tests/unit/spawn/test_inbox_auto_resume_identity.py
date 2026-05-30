@@ -11,8 +11,8 @@ These tests pin the recovery so the cascade can't silently come back.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,6 +20,8 @@ import pytest
 from fast_agent.spawn import isolated_spawner
 from fast_agent.spawn.spawn_registry import SpawnRecord
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ── Fixtures ────────────────────────────────────────────────────────
 

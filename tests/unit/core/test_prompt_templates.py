@@ -1,5 +1,4 @@
 
-import os
 
 from fast_agent.core.prompt_templates import enrich_with_environment_context
 

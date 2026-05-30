@@ -21,6 +21,8 @@ from mcp.server.fastmcp import FastMCP
 from fast_agent.spawn.message_bus import MessageBus
 from fast_agent.spawn.servers._team_helpers import (
     assert_self_identity as _assert_self_identity,
+)
+from fast_agent.spawn.servers._team_helpers import (
     auto_wake_if_idle as _auto_wake_if_idle,
 )
 

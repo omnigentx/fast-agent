@@ -774,8 +774,6 @@ def test_stdio_env_expands_dollar_var_from_parent_env(monkeypatch) -> None:
         def __init__(self, command, args, env, cwd):
             captured_env.update(env)
 
-    import fast_agent.mcp.mcp_connection_manager as mod
-
     # Exercise just the env-build slice of _server_lifecycle_task by
     # monkeypatching StdioServerParameters to capture the env it receives,
     # then driving the build via a focused reimplementation that mirrors
@@ -783,6 +781,8 @@ def test_stdio_env_expands_dollar_var_from_parent_env(monkeypatch) -> None:
     # test free from the full lifecycle machinery while still asserting
     # the contract that production depends on.
     import os
+
+    import fast_agent.mcp.mcp_connection_manager as mod
     config_env = {
         "JARVIS_RUNTIME_RPC_SOCKET": "${JARVIS_RUNTIME_RPC_SOCKET}",
         "AUTH_TOKEN": "${MY_TOKEN_X}",

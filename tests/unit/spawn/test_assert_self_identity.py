@@ -20,10 +20,7 @@ import json
 import os
 from unittest.mock import patch
 
-import pytest
-
 from fast_agent.spawn.servers._team_helpers import assert_self_identity
-
 
 # ── Helper: drive the check with controlled env + return parsed shape ──
 

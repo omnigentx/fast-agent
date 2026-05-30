@@ -451,8 +451,8 @@ class ToolAgent(LlmAgent, _ToolLoopAgent):
         )
         # File-based debug — what hooks does ToolRunner get?
         try:
-            import pathlib as _pld2
             import os as _os3
+            import pathlib as _pld2
             import time as _t2
             _dp2 = _pld2.Path(_os3.environ.get("PROJECT_DIR", ".")) / ".runtime" / "cache" / "logs" / "hooks_debug.log"
             _dp2.parent.mkdir(parents=True, exist_ok=True)

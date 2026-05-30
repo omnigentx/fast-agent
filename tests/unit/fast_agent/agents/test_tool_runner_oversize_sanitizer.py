@@ -7,14 +7,10 @@ incident 2026-05-17 (figma_read export_svg returning 777KB SVG).
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 from mcp.types import CallToolResult, TextContent
 
 from fast_agent.agents.tool_runner import (
-    _PREVIEW_BYTES,
     _DEFAULT_MAX_TOOL_RESULT_BYTES,
     _sanitize_oversized_tool_results,
 )
