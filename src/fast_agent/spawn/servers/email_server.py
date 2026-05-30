@@ -19,10 +19,8 @@ from fast_agent.spawn.servers._team_helpers import (
     auto_wake_if_idle,
     get_bus,
     get_my_name,
-    get_project_registry,
     get_team_config,
     parse_recipients,
-    resolve_agent_name,
 )
 
 logger = logging.getLogger(__name__)

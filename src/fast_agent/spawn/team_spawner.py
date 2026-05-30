@@ -17,12 +17,11 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from fast_agent.spawn.isolated_spawner import (
-    run_isolated_agent,
     run_isolated_agent_background,
 )
 from fast_agent.spawn.registry_backends import TeamSessionStore, create_team_store
-from fast_agent.spawn.spawn_hooks import SpawnLifecycleHooks
 from fast_agent.spawn.runtime_paths import get_runtime_paths
+from fast_agent.spawn.spawn_hooks import SpawnLifecycleHooks
 from fast_agent.spawn.workspace_manager import (
     create_workspace,
 )
@@ -577,7 +576,7 @@ async def _spawn_single_agent(
         # No first_task: just use the main task directly.
         # Email notifications are pushed via RTAC (InboxWatcherHook) automatically,
         # so agents don't need to poll their inbox on startup.
-        task = f"--- MAIN TASK ---\n" + task
+        task = "--- MAIN TASK ---\n" + task
     instruction = role_config.get("instruction", f"You are {agent_name}.")
     instruction = instruction.replace("{agent_name}", agent_name)
     servers = list(role_config.get("servers", ["filesystem"]))

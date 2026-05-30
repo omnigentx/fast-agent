@@ -320,7 +320,8 @@ async def _run_subprocess(
             logger.error("[_read_stderr] CRASHED after %d lines: %s", _stderr_count, _crash_exc, exc_info=True)
             if _dbg_path:
                 try:
-                    import time as _tc, traceback as _tb
+                    import time as _tc
+                    import traceback as _tb
                     with open(_dbg_path, "a") as _fc:
                         _fc.write(f"{_tc.strftime('%H:%M:%S')} !!! CRASH after {_stderr_count} lines: {_crash_exc}\n")
                         _fc.write(f"{_tc.strftime('%H:%M:%S')} Traceback:\n{''.join(_tb.format_exception(type(_crash_exc), _crash_exc, _crash_exc.__traceback__))}\n")
@@ -1184,6 +1185,7 @@ async def run_isolated_agent_background(
             if team_name and session_id:
                 try:
                     import time as _time
+
                     from fast_agent.spawn.team_spawner import get_team_session
 
                     team_session = get_team_session(session_id)
@@ -1318,7 +1320,6 @@ def cleanup_all_spawns() -> None:
     Called during shutdown (atexit, SIGTERM) to prevent orphaned
     agent subprocesses after the parent process exits.
     """
-    import signal as _signal
 
     killed = 0
     for run_id, proc in list(_background_processes.items()):

@@ -22,10 +22,10 @@ import signal as _signal
 import sys
 import tempfile
 import time
-import yaml
 from pathlib import Path
 from typing import Any
 
+import yaml
 
 from fast_agent.spawn.config_reader import (
     _load_config,
@@ -448,6 +448,7 @@ async def _save_agent_context_snapshot(
     try:
         import os as _os
         import sys as _sys
+
         from services.context_persistence import save_agent_context
 
         # Extract the actual child agent from AgentApp container.
@@ -701,7 +702,8 @@ async def run_child_agent(
                             try:
                                 response = await agent.send(pending)
                             except Exception as _send_exc:
-                                import sys, traceback
+                                import sys
+                                import traceback
                                 logger.error(
                                     "[AGENT.SEND CRASH] agent=%s error=%s",
                                     agent_name, _send_exc,
@@ -1105,6 +1107,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, role: str) -> None:
     async def spawn_after_llm(runner: Any, message: Any) -> None:
         """Emit 'response' event after each LLM reply, including reasoning."""
         import re
+
         from fast_agent.mcp.helpers.content_helpers import get_text
 
         # Extract stop reason
@@ -1225,11 +1228,15 @@ def _install_tool_hooks(agent_app: Any, run_id: str, role: str) -> None:
     pause_cancel: Any = None
     try:
         from fast_agent.spawn.pause_signal_handler import (
-            pause_before_llm as _pause_before_llm,
-            pause_before_tool as _pause_before_tool,
             pause_after_llm,
-            pause_turn_complete,
             pause_cancel_filter,
+            pause_turn_complete,
+        )
+        from fast_agent.spawn.pause_signal_handler import (
+            pause_before_llm as _pause_before_llm,
+        )
+        from fast_agent.spawn.pause_signal_handler import (
+            pause_before_tool as _pause_before_tool,
         )
         pause_before_llm = _pause_before_llm
         pause_before_tool_hook = _pause_before_tool

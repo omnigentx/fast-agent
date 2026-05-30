@@ -43,20 +43,19 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from fast_agent.spawn.config_reader import get_available_servers
-from fast_agent.spawn.runtime_paths import get_runtime_paths
 from fast_agent.spawn.isolated_spawner import (
     _check_and_resume_on_inbox,
-    _find_latest_history,
     cancel_spawn,
     run_isolated_agent,
     run_isolated_agent_background,
 )
 from fast_agent.spawn.message_bus import MessageBus
-
 from fast_agent.spawn.spawn_display import get_display_manager
 from fast_agent.spawn.spawn_registry import SpawnRegistry
 from fast_agent.spawn.team_spawner import (
     _get_store as _get_team_store,
+)
+from fast_agent.spawn.team_spawner import (
     get_team_session,
     list_team_sessions,
 )
@@ -474,7 +473,7 @@ async def spawn_and_run_background(
             "status": "spawned",
             "run_id": run_id,
             "message": (
-                f"Agent spawned in background. Results will be auto-delivered when complete."
+                "Agent spawned in background. Results will be auto-delivered when complete."
             ),
         }
     )
@@ -589,7 +588,7 @@ async def restart_spawn(run_id: str) -> str:
             "original_run_id": run_id,
             "new_run_id": new_run_id,
             "restart_count": record.restart_count + 1,
-            "message": (f"Spawn restarted. Results will be auto-delivered when complete."),
+            "message": ("Spawn restarted. Results will be auto-delivered when complete."),
         }
     )
 

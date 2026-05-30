@@ -1,3 +1,13 @@
+"""
+Testing notes:
+
+- This module owns the HuggingFace ACP wizard's curated-model smoke tests.
+- Exact option ordering is only asserted where numbered wizard selection depends
+  on that ordering as a user-visible contract.
+- Prefer membership and flow-transition checks over duplicating the full
+  curated model list.
+"""
+
 from __future__ import annotations
 
 import sys
@@ -10,6 +20,36 @@ def _ensure_hf_inference_acp_on_path() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     package_root = repo_root / "publish" / "hf-inference-acp" / "src"
     sys.path.insert(0, str(package_root))
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_path_and_modules():
+    """Cleanup ``sys.path`` mutations from ``_ensure_hf_inference_acp_on_path``
+    plus any modules imported from that path.
+
+    Without this, the hf-inference-acp package stays importable across the
+    rest of the test session and any logger setup it does at import time
+    leaks into unrelated tests — concretely, ``caplog.set_level(WARNING)``
+    in ``test_resume_warns_loudly_when_team_name_unrecoverable`` stops
+    capturing because hf_inference_acp's structured-logger configuration
+    swaps the root handler. Snapshot and restore around each test in this
+    module so the wizard suite stays self-contained.
+    """
+    path_snapshot = list(sys.path)
+    modules_snapshot = set(sys.modules)
+    try:
+        yield
+    finally:
+        sys.path[:] = path_snapshot
+        # Drop any newly-imported hf_inference_acp.* modules so a later
+        # test that re-adds the path imports fresh and a test that
+        # doesn't gets the absence it expects.
+        for mod_name in list(sys.modules.keys()):
+            if mod_name not in modules_snapshot and (
+                mod_name == "hf_inference_acp"
+                or mod_name.startswith("hf_inference_acp.")
+            ):
+                sys.modules.pop(mod_name, None)
 
 
 @pytest.mark.asyncio
@@ -27,7 +67,8 @@ async def test_wizard_model_selection_uses_curated_ids() -> None:
     llm._state.first_message = False  # skip welcome
     llm._state.stage = WizardStage.MODEL_SELECT
 
-    # Pick the first curated model by number.
+    # Pick the first curated model by number. In this wizard, numeric ordering
+    # is part of the user-visible selection contract.
     response = await llm._handle_model_select("1")
     assert llm._state.selected_model == CURATED_MODELS[0].id
     assert llm._state.stage == WizardStage.MCP_CONNECT
@@ -42,5 +83,6 @@ def test_wizard_curated_models_include_qwen35_and_kimi25_profiles() -> None:
 
     ids = {entry.id for entry in model_catalog.CURATED_MODELS}
     assert "kimi25" in ids
+    assert "kimi25instant" in ids
     assert "qwen35" in ids
     assert "qwen35instruct" in ids

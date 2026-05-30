@@ -245,7 +245,9 @@ class SpawnDisplayManager:
 
         # File-based debug — trace every event through display
         try:
-            import os, pathlib, time
+            import os
+            import pathlib
+            import time
             prj = os.environ.get("SPAWN_PROJECT_DIR", ".")
             dbg = pathlib.Path(prj) / ".runtime" / "cache" / "logs" / "display_handle_debug.log"
             dbg.parent.mkdir(parents=True, exist_ok=True)
