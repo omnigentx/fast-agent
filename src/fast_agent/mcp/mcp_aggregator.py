@@ -182,6 +182,49 @@ class ServerStats:
         self.reconnect_count += 1
 
 
+def _with_stdio_stderr_tail(
+    error_message: object, stderr_lines: "tuple[str, ...] | list[str] | None"
+) -> str | None:
+    """Append captured stdio subprocess stderr to a server's error message.
+
+    ``error_message`` may be ``None``, a ``str``, or a ``list`` (the connection
+    manager stores ExceptionGroup details as a list of strings). Returns a single
+    normalised string (or ``None`` when there is nothing to report) so the value
+    fits ServerStatus.error_message (typed ``str | None``) and the UI renders the
+    real subprocess traceback rather than a generic "Connection closed".
+    """
+    if error_message is None:
+        existing = ""
+    elif isinstance(error_message, str):
+        existing = error_message
+    else:
+        # list/tuple of detail lines from extract_errors()/format_exception()
+        existing = "\n".join(str(part) for part in error_message)
+
+    if not stderr_lines:
+        return existing or None
+
+    stderr_block = "Recent stderr from stdio server:\n" + "\n".join(
+        f"  {line}" for line in stderr_lines
+    )
+    return f"{existing}\n\n{stderr_block}" if existing else stderr_block
+
+
+def _format_attach_error(exc: BaseException) -> str:
+    """Render a server-attach exception into readable text for the UI.
+
+    ServerInitializationError (and friends) carry a short ``message`` plus a
+    ``details`` blob that already includes the stdio subprocess stderr (the real
+    cause: ModuleNotFoundError, bad flag, …). We keep both so the surfaced error
+    is actionable rather than a bare exception class name.
+    """
+    message = getattr(exc, "message", None)
+    details = getattr(exc, "details", None)
+    if message:
+        return f"{message}\n\n{details}" if details else str(message)
+    return f"{type(exc).__name__}: {exc}"
+
+
 class ServerStatus(BaseModel):
     server_name: str
     implementation_name: str | None = None
@@ -346,6 +389,10 @@ class MCPAggregator(ContextDependent):
         self.server_names = list(server_names)
         self._attached_server_names: list[str] = []
         self._supplemental_attached_server_names: list[str] = []
+        # Last attach error per server, captured in load_servers(). Survives the
+        # connection being dropped from running_servers on startup failure, so a
+        # failed server's real cause still reaches collect_server_status() / the UI.
+        self._server_attach_errors: dict[str, str] = {}
         self.connection_persistence = connection_persistence
         self.agent_name = name
         self.config = config  # Store the config for access in session factory
@@ -649,6 +696,7 @@ class MCPAggregator(ContextDependent):
                     f"Connected to MCP server '{server_name}' in {_elapsed:.1f}s "
                     f"({len(result.tools_added)} tools)",
                 )
+                self._server_attach_errors.pop(server_name, None)
                 attached_results.append(result)
             except Exception as exc:
                 _elapsed = _time.monotonic() - _t0
@@ -656,7 +704,11 @@ class MCPAggregator(ContextDependent):
                     f"Failed to connect to MCP server '{server_name}' after {_elapsed:.1f}s: {exc}",
                     exc_info=True,
                 )
-                # Continue with remaining servers instead of blocking all
+                # Persist the cause so collect_server_status()/the UI can show the
+                # real reason (the conn is dropped from running_servers on failure,
+                # so this is the only place it survives). Then continue with the
+                # remaining servers instead of blocking all.
+                self._server_attach_errors[server_name] = _format_attach_error(exc)
                 continue
 
         if skipped_servers:
@@ -691,6 +743,7 @@ class MCPAggregator(ContextDependent):
             self._capabilities_cache.clear()
 
         self._skybridge_configs.clear()
+        self._server_attach_errors.clear()
         self._attached_server_names = []
 
     async def _fetch_server_tools(self, server_name: str) -> list[Tool]:
@@ -1479,6 +1532,16 @@ class MCPAggregator(ContextDependent):
                             is_connected = False
                             error_message = error_message or "initializing..."
                         error_message = error_message or server_conn._error_message
+                        # For a failed stdio server the parent-side error is often
+                        # just "Connection closed" — useless for debugging. The
+                        # subprocess's own stderr (captured into _stdio_stderr_lines)
+                        # carries the real cause: ModuleNotFoundError, ImportError,
+                        # a bad CLI flag, etc. Fold that tail into error_message so
+                        # the UI shows the actual traceback instead of a generic msg.
+                        if is_connected is not True:
+                            error_message = _with_stdio_stderr_tail(
+                                error_message, server_conn.recent_stdio_stderr_lines()
+                            )
                         instructions_available = server_conn.server_instructions_available
                         instructions_enabled = server_conn.server_instructions_enabled
                         instructions_included = bool(server_conn.server_instructions)
@@ -1607,6 +1670,15 @@ class MCPAggregator(ContextDependent):
                 if self.context and self.context.config is not None:
                     auto_sampling = self.context.config.auto_sampling
                 sampling_mode = sampling_mode or ("auto" if auto_sampling else "off")
+
+            # No live error (server failed to attach and its conn was dropped, or
+            # connection_persistence is off) → fall back to the attach error we
+            # captured in load_servers(). This is what turns "No error message
+            # reported" in the UI into the actual cause.
+            if not error_message:
+                error_message = self._server_attach_errors.get(server_name)
+                if error_message and is_connected is None:
+                    is_connected = False
 
             status_map[server_name] = ServerStatus(
                 server_name=server_name,

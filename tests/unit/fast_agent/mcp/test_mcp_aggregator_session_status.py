@@ -92,3 +92,89 @@ async def test_collect_server_status_includes_experimental_session_cookie() -> N
     }
     assert status.session_title is None
     assert status.session_id == "local"
+
+
+class _FailedServerConnStub(_ServerConnStub):
+    """A stdio server that crashed at startup: parent side only saw
+    'Connection closed', but the subprocess wrote a real traceback to stderr."""
+
+    def __init__(self, config: MCPServerSettings) -> None:
+        super().__init__(config)
+        # Parent-side error is generic and unhelpful on its own.
+        self._error_message = "McpError: Connection closed"
+        self._stderr = (
+            "Traceback (most recent call last):",
+            '  File "tools/story_server.py", line 10, in <module>',
+            "    from helpers.http_safety import get_capped_text",
+            "ModuleNotFoundError: No module named 'helpers'",
+        )
+
+    def is_healthy(self) -> bool:
+        return False
+
+    def recent_stdio_stderr_lines(self) -> tuple[str, ...]:
+        return self._stderr
+
+
+@pytest.mark.asyncio
+async def test_collect_server_status_surfaces_stdio_stderr_for_failed_server() -> None:
+    config = MCPServerSettings(name="demo", transport="stdio", command="python")
+    context = _build_context({"demo": config})
+
+    aggregator = MCPAggregator(
+        server_names=["demo"],
+        connection_persistence=True,
+        context=context,
+    )
+    aggregator.initialized = True
+
+    server_conn = _FailedServerConnStub(config)
+    manager = _ManagerStub(server_conn)
+    setattr(aggregator, "_persistent_connection_manager", manager)
+
+    status_map = await aggregator.collect_server_status()
+    status = status_map["demo"]
+
+    assert status.is_connected is False
+    assert status.error_message is not None
+    # The generic parent-side error is preserved...
+    assert "Connection closed" in status.error_message
+    # ...and the real subprocess cause is now surfaced for debugging.
+    assert "Recent stderr from stdio server:" in status.error_message
+    assert "ModuleNotFoundError: No module named 'helpers'" in status.error_message
+
+
+@pytest.mark.asyncio
+async def test_collect_server_status_falls_back_to_captured_attach_error() -> None:
+    """The real failure mode: a stdio server crashes at startup, its connection is
+    dropped from running_servers, but load_servers() captured the cause. The UI must
+    still see it instead of "No error message reported"."""
+    config = MCPServerSettings(name="demo", transport="stdio", command="python")
+    context = _build_context({"demo": config})
+
+    aggregator = MCPAggregator(
+        server_names=["demo"],
+        connection_persistence=True,
+        context=context,
+    )
+    aggregator.initialized = True
+    aggregator._server_attach_errors = {
+        "demo": (
+            "MCP Server: 'demo': Failed to initialize - see details.\n\n"
+            "Recent stderr from stdio server:\n"
+            "  ModuleNotFoundError: No module named 'helpers'"
+        )
+    }
+
+    # running_servers is empty — the conn was dropped on failure.
+    manager = _ManagerStub.__new__(_ManagerStub)
+    manager._lock = Lock()
+    manager.running_servers = {}
+    setattr(aggregator, "_persistent_connection_manager", manager)
+
+    status_map = await aggregator.collect_server_status()
+    status = status_map["demo"]
+
+    assert status.is_connected is False
+    assert status.error_message is not None
+    assert "ModuleNotFoundError: No module named 'helpers'" in status.error_message
