@@ -351,6 +351,11 @@ class ServerConnection:
         self._last_oauth_authorization_url: str | None = None
         self._oauth_abort_event = threading.Event()
         self._stdio_stderr_lines: deque[str] = deque(maxlen=STDIO_STDERR_BUFFER_LINES)
+        # Guards _stdio_stderr_lines: the stdio stderr pump runs on a daemon
+        # thread (tracking_stdio_client) and appends here while the event loop
+        # reads via recent_stdio_stderr_lines() — without this, tuple() over the
+        # deque mid-append can raise "deque mutated during iteration".
+        self._stdio_stderr_lock = threading.Lock()
         self._lifecycle_cancel_scope: CancelScope | None = None
 
     def is_healthy(self) -> bool:
@@ -361,7 +366,8 @@ class ServerConnection:
         """Reset the error state, allowing reconnection attempts."""
         self._error_occurred = False
         self._error_message = None
-        self._stdio_stderr_lines.clear()
+        with self._stdio_stderr_lock:
+            self._stdio_stderr_lines.clear()
 
     def request_shutdown(self) -> None:
         """
@@ -458,10 +464,12 @@ class ServerConnection:
     def record_stdio_stderr(self, line: str) -> None:
         text = line.strip()
         if text:
-            self._stdio_stderr_lines.append(text)
+            with self._stdio_stderr_lock:
+                self._stdio_stderr_lines.append(text)
 
     def recent_stdio_stderr_lines(self) -> tuple[str, ...]:
-        return tuple(self._stdio_stderr_lines)
+        with self._stdio_stderr_lock:
+            return tuple(self._stdio_stderr_lines)
 
     def record_ping_event(self, state: str) -> None:
         self._ping_history.append((datetime.now(timezone.utc), state))

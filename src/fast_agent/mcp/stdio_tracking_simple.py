@@ -93,6 +93,12 @@ async def tracking_stdio_client(
                     write_file.close()
                 except Exception:  # pragma: no cover
                     pass
+                # EOF reaches the pump only once every write end of the pipe is
+                # closed: our write_file (above) AND the child's inherited stderr
+                # fd. On the happy path stdio_client.__aexit__ has already reaped
+                # the child, so join returns immediately. The 2s cap is a backstop
+                # for the rare case where a forked grandchild keeps fd 2 open and
+                # EOF never arrives — we cap teardown and let the daemon thread go.
                 pump.join(timeout=2.0)
                 try:
                     read_file.close()
