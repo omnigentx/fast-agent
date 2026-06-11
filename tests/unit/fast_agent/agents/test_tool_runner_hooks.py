@@ -1063,3 +1063,127 @@ async def test_tool_use_hook_messages_flush_after_tool_results() -> None:
         "tool_result:tool_one",
         "status:▎ extension llm_time — 42ms",
     ]
+
+
+# ── on_context_overflow ──
+
+
+class OverflowOnceLlm(PassthroughLLM):
+    """LLM whose first call fails with a context-window overflow error,
+    then succeeds — simulates a gateway routing the aliased model to a
+    smaller-window model mid-conversation. The overflow must bypass the
+    transient-error retry loop (fatal) and reach on_context_overflow.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._calls = 0
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages,
+        request_params=None,
+        tools=None,
+        is_template=False,
+    ):
+        self._calls += 1
+        if self._calls == 1:
+            raise Exception(
+                "Error code: 400 - This model's maximum context length is "
+                "200000 tokens, however you requested 250000 tokens."
+            )
+        return Prompt.assistant("done after compaction", stop_reason=LlmStopReason.END_TURN)
+
+
+class OverflowAlwaysLlm(PassthroughLLM):
+    """Every call overflows — compaction could not shrink below the window."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._calls = 0
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages,
+        request_params=None,
+        tools=None,
+        is_template=False,
+    ):
+        self._calls += 1
+        raise Exception("This model's maximum context length is 200000 tokens.")
+
+
+class OverflowHookAgent(ToolAgent):
+    """Agent whose on_context_overflow "compacts" (records) and retries."""
+
+    def __init__(self, *args, hook_result=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.overflow_errors: list[Exception] = []
+        self._hook_result = hook_result
+
+    def _tool_runner_hooks(self):
+        async def on_context_overflow(runner, error):
+            self.overflow_errors.append(error)
+            return self._hook_result
+
+        return ToolRunnerHooks(on_context_overflow=on_context_overflow)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_context_overflow_retries_llm_call():
+    """Overflow → hook compacts (returns True) → the call is reissued and
+    the turn completes normally."""
+    llm = OverflowOnceLlm()
+    agent = OverflowHookAgent(AgentConfig("overflow-retry"))
+    agent._llm = llm
+
+    result = await agent.generate("hi")
+
+    assert result.last_text() == "done after compaction"
+    assert llm._calls == 2  # first overflowed, second succeeded
+    assert len(agent.overflow_errors) == 1
+    assert "maximum context length" in str(agent.overflow_errors[0])
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_context_overflow_returning_false_propagates():
+    """Hook could not compact (returns False) → the error must propagate,
+    not loop forever."""
+    llm = OverflowOnceLlm()
+    agent = OverflowHookAgent(AgentConfig("overflow-no-compact"), hook_result=False)
+    agent._llm = llm
+
+    with pytest.raises(Exception, match="maximum context length"):
+        await agent.generate("hi")
+    assert llm._calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_context_overflow_retries_at_most_once():
+    """A second consecutive overflow means compaction did not shrink the
+    payload below the window — it must propagate instead of retrying
+    indefinitely."""
+    llm = OverflowAlwaysLlm()
+    agent = OverflowHookAgent(AgentConfig("overflow-twice"))
+    agent._llm = llm
+
+    with pytest.raises(Exception, match="maximum context length"):
+        await agent.generate("hi")
+    assert llm._calls == 2
+    assert len(agent.overflow_errors) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_overflow_without_hook_propagates():
+    """No hook registered → original error surfaces unchanged."""
+    llm = OverflowOnceLlm()
+    agent = ToolAgent(AgentConfig("overflow-unhooked"))
+    agent._llm = llm
+
+    with pytest.raises(Exception, match="maximum context length"):
+        await agent.generate("hi")
+    assert llm._calls == 1
