@@ -8,7 +8,6 @@ from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.types import PromptMessageExtended
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
-
 # Provider phrasings for "the request exceeds the model's context window".
 # Matched against the exception message because OpenAI-compatible gateways
 # (9router etc.) forward upstream errors with assorted codes/status values —
