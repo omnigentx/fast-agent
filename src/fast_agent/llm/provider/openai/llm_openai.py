@@ -1084,12 +1084,21 @@ class OpenAILLM(
             # model whose window ModelDatabase knows — keep the
             # accumulator's window in sync with the model that actually
             # served this call (unless an explicit override is active).
+            # This reflects the LAST serving model, not a min/aggregate:
+            # under gateway rotation it can oscillate, so any consumer that
+            # needs a stable bound (e.g. a compaction threshold) should
+            # track the minimum window seen itself.
             if self._context_window_override is None:
                 try:
                     serving_model = getattr(response, "model", None)
-                    window = _resolve_serving_model_window(serving_model)
-                    if window:
-                        self._usage_accumulator.set_context_window_size(window)
+                    # Skip the resolve+set when the serving model is
+                    # unchanged since the last response — resolution is
+                    # deterministic, so re-running it every call is wasted
+                    # work.
+                    if serving_model and serving_model != self._last_serving_model:
+                        window = _resolve_serving_model_window(serving_model)
+                        if window:
+                            self._usage_accumulator.set_context_window_size(window)
                         self._last_serving_model = serving_model
                 except Exception as e:
                     self.logger.debug(f"Serving-model window update skipped: {e}")
