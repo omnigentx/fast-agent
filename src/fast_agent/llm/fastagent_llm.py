@@ -247,6 +247,11 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         # extended-context opt-ins. Defaults to None (use ModelDatabase value).
         self._context_window_override: int | None = None
 
+        # Real model reported by the provider in the last response —
+        # differs from the requested name when a gateway routes an alias
+        # (e.g. a 9router combo) to a concrete model.
+        self._last_serving_model: str | None = None
+
         # Warn if long_context was requested but this provider didn't handle it
         if long_context_requested and self._context_window_override is None:
             self.logger.warning(
@@ -644,6 +649,14 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
         def _is_fatal_error(e: Exception) -> bool:
             if isinstance(e, (KeyboardInterrupt, AgentConfigError, ServerConfigError)):
+                return True
+            # Context overflow: the identical payload can never fit on
+            # retry — raise immediately so the tool runner's
+            # on_context_overflow hook can compact the history and
+            # reissue the call with a rebuilt (smaller) payload.
+            from fast_agent.llm.provider.error_utils import is_context_overflow_error
+
+            if is_context_overflow_error(e):
                 return True
             if isinstance(e, ProviderKeyError):
                 msg = str(e).lower()

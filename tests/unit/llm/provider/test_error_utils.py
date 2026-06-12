@@ -1,9 +1,13 @@
 """Tests for LLM provider error utilities."""
 
+import pytest
 from mcp.types import TextContent
 
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
-from fast_agent.llm.provider.error_utils import build_stream_failure_response
+from fast_agent.llm.provider.error_utils import (
+    build_stream_failure_response,
+    is_context_overflow_error,
+)
 from fast_agent.llm.provider_types import Provider
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
@@ -147,3 +151,55 @@ class TestBuildStreamFailureResponse:
 
         error_text = _get_error_text(result)
         assert "simple value error" in error_text
+
+
+# ── is_context_overflow_error: the regex table is the contract ──
+# A false negative silently disables overflow recovery, so pin every
+# phrasing that must classify True and adversarial near-misses that must
+# stay False.
+
+_OVERFLOW_TRUE = [
+    "context_length_exceeded",
+    "This model's maximum context length is 200000 tokens, however you requested 250000",
+    "The context window for this model is 128k tokens",
+    "prompt is too long: 210000 tokens > 200000 maximum",
+    "Your input is too long for the model",
+    "Request contains too many tokens",
+    "request_too_large",
+    "This request exceeds the model's context limit",
+    "exceeds the token limit for this model",
+    "exceeds the maximum context length",
+]
+
+_OVERFLOW_FALSE = [
+    "rate limit exceeded, please retry",
+    "429 Too Many Requests",
+    "Connection reset by peer",
+    "invalid api key",
+    "quota exhausted for this org",
+    "the server is overloaded",
+    "internal server error",
+    "model is currently unavailable",
+    "",
+]
+
+
+@pytest.mark.parametrize("msg", _OVERFLOW_TRUE)
+def test_is_context_overflow_error_true(msg):
+    assert is_context_overflow_error(Exception(msg)) is True
+
+
+@pytest.mark.parametrize("msg", _OVERFLOW_FALSE)
+def test_is_context_overflow_error_false(msg):
+    assert is_context_overflow_error(Exception(msg)) is False
+
+
+def test_is_context_overflow_error_matches_on_code_attribute():
+    # The structured `code` attribute is authoritative even when the
+    # message text doesn't contain a known phrasing.
+    assert is_context_overflow_error(
+        FakeAPIError("the request failed", code="context_length_exceeded")
+    ) is True
+    assert is_context_overflow_error(
+        FakeAPIError("the request failed", code="rate_limit_exceeded")
+    ) is False

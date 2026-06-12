@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -70,6 +71,28 @@ class EmptyStreamError(RuntimeError):
 
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_REASONING_EFFORT = "low"
+
+
+def _resolve_serving_model_window(serving_model: str | None) -> int | None:
+    """Context window for the model named in ``response.model``.
+
+    OpenAI-compatible gateways (9router combos etc.) accept an alias in the
+    request but report the real serving model in the response — the only
+    reliable window signal when the requested name is unknown to
+    ModelDatabase. Gateways often report dotted versions
+    ("claude-sonnet-4.5") where database keys use dashes
+    ("claude-sonnet-4-5"), so retry with dots-in-version normalized.
+    """
+    if not serving_model:
+        return None
+    from fast_agent.llm.model_database import ModelDatabase
+
+    window = ModelDatabase.get_context_window(serving_model)
+    if window is None and "." in serving_model:
+        window = ModelDatabase.get_context_window(
+            re.sub(r"(\d)\.(\d)", r"\1-\2", serving_model)
+        )
+    return int(window) if window else None
 
 
 class OpenAILLM(
@@ -1057,6 +1080,28 @@ class OpenAILLM(
                 self._finalize_turn_usage(turn_usage)
             except Exception as e:
                 self.logger.warning(f"Failed to track usage: {e}")
+            # The gateway may have routed the aliased request to a real
+            # model whose window ModelDatabase knows — keep the
+            # accumulator's window in sync with the model that actually
+            # served this call (unless an explicit override is active).
+            # This reflects the LAST serving model, not a min/aggregate:
+            # under gateway rotation it can oscillate, so any consumer that
+            # needs a stable bound (e.g. a compaction threshold) should
+            # track the minimum window seen itself.
+            if self._context_window_override is None:
+                try:
+                    serving_model = getattr(response, "model", None)
+                    # Skip the resolve+set when the serving model is
+                    # unchanged since the last response — resolution is
+                    # deterministic, so re-running it every call is wasted
+                    # work.
+                    if serving_model and serving_model != self._last_serving_model:
+                        window = _resolve_serving_model_window(serving_model)
+                        if window:
+                            self._usage_accumulator.set_context_window_size(window)
+                        self._last_serving_model = serving_model
+                except Exception as e:
+                    self.logger.debug(f"Serving-model window update skipped: {e}")
 
         self.logger.debug(
             "OpenAI completion response:",

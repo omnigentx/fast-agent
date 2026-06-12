@@ -243,6 +243,14 @@ class ToolRunnerHooks:
       caller awaits resume); False to let CancelledError propagate as
       usual. Lets PauseController interrupt long-running LLM streams
       without tearing down the surrounding chat request.
+    - on_context_overflow: Optional async handler for context-window
+      overflow errors raised from inside the LLM call (the payload
+      exceeded the model's limit, e.g. after a gateway routed to a
+      smaller-window model). Returns True when it shrank the history
+      (compaction) and the call should be reissued — the payload is
+      rebuilt from message_history + delta, so the retry picks the
+      compacted context up automatically. Retried at most once per
+      iteration; False (or absence) lets the error propagate.
     """
 
     before_llm_call: (
@@ -255,6 +263,7 @@ class ToolRunnerHooks:
         Callable[["ToolRunner", PromptMessageExtended], Awaitable[None]] | None
     ) = None
     on_pause_cancel: Callable[["ToolRunner"], Awaitable[bool]] | None = None
+    on_context_overflow: Callable[["ToolRunner", Exception], Awaitable[bool]] | None = None
 
 
 class ToolRunner:
@@ -359,6 +368,7 @@ class ToolRunner:
         # state so subsequent awaits don't immediately re-raise.
         # Falls through (raise) when no hook is registered or the hook
         # says the cancel was genuine.
+        overflow_retried = False
         while True:
             try:
                 assistant_message = await self._agent._tool_runner_llm_step(
@@ -380,6 +390,21 @@ class ToolRunner:
                     asyncio.current_task().uncancel()
                 except (AttributeError, RuntimeError):
                     pass  # uncancel unavailable / not a Task — re-raise next iter
+                continue
+            except Exception as llm_error:
+                # Context-window overflow: give the hook one chance to
+                # compact the history, then reissue the call (the payload
+                # is rebuilt from message_history + delta). Once per
+                # iteration — a second overflow means compaction could
+                # not shrink below the window, so it must propagate.
+                from fast_agent.llm.provider.error_utils import is_context_overflow_error
+
+                hook = self._hooks.on_context_overflow
+                if hook is None or overflow_retried or not is_context_overflow_error(llm_error):
+                    raise
+                if not await hook(self, llm_error):
+                    raise
+                overflow_retried = True
                 continue
 
             # Path B: provider swallowed CancelledError and returned a

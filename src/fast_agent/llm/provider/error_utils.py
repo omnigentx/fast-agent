@@ -1,10 +1,42 @@
 """Utility functions for LLM provider error handling."""
 
+import re
+
 from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL
 from fast_agent.llm.provider_types import Provider
 from fast_agent.mcp.helpers.content_helpers import text_content
 from fast_agent.types import PromptMessageExtended
 from fast_agent.types.llm_stop_reason import LlmStopReason
+
+# Provider phrasings for "the request exceeds the model's context window".
+# Matched against the exception message because OpenAI-compatible gateways
+# (9router etc.) forward upstream errors with assorted codes/status values —
+# the message text is the only stable signal across providers.
+_CONTEXT_OVERFLOW_PATTERNS = re.compile(
+    r"context_length_exceeded"
+    r"|maximum context length"
+    r"|context window"
+    r"|prompt is too long"
+    r"|input is too long"
+    r"|too many tokens"
+    r"|request_too_large"
+    r"|exceeds? the (?:model'?s? )?(?:context|token) limit",
+    re.IGNORECASE,
+)
+
+
+def is_context_overflow_error(error: BaseException) -> bool:
+    """True when the error means the request payload exceeded the model's
+    context window. Retrying the identical payload can never succeed —
+    callers should shrink the context (compaction) before retrying.
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code == "context_length_exceeded":
+        return True
+    detail = getattr(error, "message", None) or str(error)
+    if not isinstance(detail, str):
+        return False
+    return bool(_CONTEXT_OVERFLOW_PATTERNS.search(detail))
 
 
 def build_stream_failure_response(
