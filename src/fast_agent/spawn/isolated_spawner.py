@@ -84,6 +84,7 @@ def _build_handoff_config(
     max_depth: int = DEFAULT_MAX_DEPTH,
     workspace_dir: str | None = None,
     role: str = "agent",
+    agent_name: str = "",
     skills: list[str] | None = None,
     history_file: str | None = None,
     server_overrides: dict[str, dict] | None = None,
@@ -117,6 +118,10 @@ def _build_handoff_config(
         "workspace_dir": ws_dir,
         "result_file": result_file,
         "role": role,
+        # ``agent_name`` is the agent's IDENTITY (role is a display label).
+        # The worker (isolated_runner) reads this before falling back to role
+        # so the registry / activity / SSE all key on the real unique name.
+        "agent_name": agent_name,
         "lifecycle": lifecycle,
         "team_name": team_name,
     }
@@ -472,6 +477,7 @@ async def run_isolated_agent(
         max_depth=max_depth,
         workspace_dir=workspace_dir,
         role=role or "agent",
+        agent_name=agent_name or role or "agent",
         skills=skills,
         history_file=history_file,
         server_overrides=server_overrides,

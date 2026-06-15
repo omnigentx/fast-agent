@@ -62,32 +62,122 @@ _AGENT_NAME_POOL = [
 ]
 
 
+def _collect_taken_names(
+    registry: "SpawnRegistry",
+    db_path: str | None = None,
+) -> set[str]:
+    """Union of every agent name currently considered "taken".
+
+    Single definition of taken-ness, shared by ``_generate_unique_agent_name``
+    (which avoids these) and ``ensure_unique_agent_name`` (which rejects on
+    collision). Sources:
+
+      1. live in-process registry (running/idle/pending agents);
+      2. DB-backed team sessions (cross-process siblings this process never
+         saw in memory);
+      3. persistent dynamic agents (``agent_definitions`` table).
+
+    Supplementary-read failures (missing table on a fresh DB, transient read
+    error) are swallowed: the in-process registry is the live source of
+    truth, and the persistent-spawn path still has an authoritative UNIQUE
+    constraint on INSERT (``_persist_dynamic_agent_to_db``). So a degraded
+    supplementary read can never let a *live* duplicate through here.
+    """
+    import os
+    import sqlite3
+
+    names: set[str] = set()
+
+    # 1. live in-process registry
+    try:
+        names |= {r.agent_name for r in registry.list_active() if r.agent_name}
+    except Exception:
+        pass
+
+    # 2. DB-backed team sessions (cross-process)
+    try:
+        for data in _get_store().list_all():
+            for agent_info in (data.get("agents") or {}).values():
+                name = agent_info.get("agent_name", "")
+                if name:
+                    names.add(name)
+    except Exception:
+        pass
+
+    # 3. persistent dynamic agents (agent_definitions table)
+    db_path = db_path or os.environ.get("SPAWN_REGISTRY_DB")
+    if db_path:
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute("SELECT name FROM agent_definitions").fetchall()
+                names |= {r[0] for r in rows if r[0]}
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    return names
+
+
+def ensure_unique_agent_name(
+    name: str,
+    *,
+    registry: "SpawnRegistry",
+    db_path: str | None = None,
+) -> None:
+    """Reject creation of an agent whose name is already taken.
+
+    The uniqueness gate for the two EXPLICIT-name creation entry points —
+    ``spawn_agent`` (persistent) and ``spawn_and_run_isolated`` — where the
+    caller supplies a name that must be validated. The team paths
+    (``spawn_team`` / ``spawn_team_members``) and the auto-generate branch of
+    ``spawn_and_run_isolated`` instead call ``_generate_unique_agent_name``,
+    which *avoids* taken names rather than rejecting. Both read the same
+    taken-set via ``_collect_taken_names``.
+
+    Resume / restart / auto-wake paths do NOT call this: they take a
+    ``run_id`` and load the name from an existing record, so they have no new
+    name to validate.
+
+    Raises ``ValueError`` on empty name or collision.
+    """
+    if not name or not name.strip():
+        raise ValueError("agent name must be a non-empty string")
+    if name in _collect_taken_names(registry, db_path):
+        raise ValueError(
+            f"agent '{name}' already exists — names must be unique; "
+            f"choose a different name"
+        )
+
+
 def _generate_unique_agent_name(
     role_display: str,
     registry: "SpawnRegistry",
+    also_exclude: set[str] | None = None,
 ) -> str:
     """Generate a unique agent name: '{RandomName} [{Role}]'.
 
-    Checks active agents in registry to avoid name collision.
+    Checks active agents in registry to avoid name collision. ``also_exclude``
+    adds names that are spoken-for *within the current batch* but not yet
+    visible to ``_collect_taken_names`` — e.g. names assigned to
+    ``session.agents`` during a ``spawn_team`` pre-register loop, which is only
+    flushed via ``write_roster()``/``upsert`` AFTER the loop. Without it, two
+    roles sharing the same ``role_display`` could be handed the same name and
+    the second would silently overwrite the first in ``session.agents`` → one
+    agent lost.
+
     Falls back to name+number if pool is exhausted.
     """
     import random
 
-    # Collect all active agent names from registry
-    try:
-        active_names = {r.agent_name for r in registry.list_active()}
-    except Exception:
-        active_names = set()
-
-    # Also check names already used in stored team sessions (DB-backed
-    # cross-process — covers sessions spawned by sibling subprocesses
-    # that this process never touched in memory).
-    try:
-        for data in _get_store().list_all():
-            for agent_info in (data.get("agents") or {}).values():
-                active_names.add(agent_info.get("agent_name", ""))
-    except Exception:
-        pass
+    # Single source of "taken" names (registry + team sessions + persistent
+    # definitions) — see ``_collect_taken_names`` — unioned with any names
+    # already reserved earlier in the current batch (not yet flushed to a
+    # store that ``_collect_taken_names`` reads).
+    active_names = _collect_taken_names(registry)
+    if also_exclude:
+        active_names = active_names | also_exclude
 
     available = [
         n for n in _AGENT_NAME_POOL
@@ -481,7 +571,13 @@ async def spawn_team(
     # Pre-register all agents: orchestrator as 'pending', others as 'available'
     for role_name, role_config in roles.items():
         role_display = role_config.get("role_display", role_name.upper())
-        agent_name = _generate_unique_agent_name(role_display, registry)
+        # Exclude names already reserved earlier in THIS loop: they live only
+        # in session.agents until write_roster() below, so _collect_taken_names
+        # can't see them yet. Two roles with the same role_display would
+        # otherwise be handed the same name → second overwrites first.
+        agent_name = _generate_unique_agent_name(
+            role_display, registry, also_exclude=set(session.agents)
+        )
         run_id = f"team_{session_id}_{role_name}_{uuid.uuid4().hex[:6]}"
         status = "pending" if role_name == orchestrator_role else "available"
         session.agents[agent_name] = {
@@ -559,7 +655,9 @@ async def _spawn_single_agent(
             break
     if not agent_name:
         role_display = role_config.get("role_display", role_name.upper())
-        agent_name = _generate_unique_agent_name(role_display, registry)
+        agent_name = _generate_unique_agent_name(
+            role_display, registry, also_exclude=set(session.agents)
+        )
 
     task = role_config.get("task", project_brief)
 
@@ -691,9 +789,13 @@ async def spawn_team_members_for_session(
                 agent_name = name
                 break
         if not agent_name:
-            # Agent for this role wasn't pre-registered — generate a new name
+            # Agent for this role wasn't pre-registered — generate a new name,
+            # excluding names already reserved earlier in this loop (only in
+            # session.agents until the upsert below).
             role_display = role_config.get("role_display", role_name.upper())
-            agent_name = _generate_unique_agent_name(role_display, registry)
+            agent_name = _generate_unique_agent_name(
+                role_display, registry, also_exclude=set(session.agents)
+            )
 
         existing = session.agents.get(agent_name, {})
         if existing.get("status") not in ("available", None):
