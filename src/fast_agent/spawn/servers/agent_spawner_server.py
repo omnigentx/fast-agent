@@ -53,11 +53,13 @@ from fast_agent.spawn.message_bus import MessageBus
 from fast_agent.spawn.spawn_display import get_display_manager
 from fast_agent.spawn.spawn_registry import SpawnRegistry
 from fast_agent.spawn.team_spawner import (
-    _get_store as _get_team_store,
-)
-from fast_agent.spawn.team_spawner import (
+    _generate_unique_agent_name,
+    ensure_unique_agent_name,
     get_team_session,
     list_team_sessions,
+)
+from fast_agent.spawn.team_spawner import (
+    _get_store as _get_team_store,
 )
 from fast_agent.spawn.team_spawner import (
     list_team_templates as _list_templates,
@@ -356,6 +358,7 @@ async def spawn_and_run_isolated(
     model: str = "",
     timeout_seconds: int = 120,
     role: str = "",
+    agent_name: str = "",
     lifecycle: str = "oneshot",
     skills: str = "",
 ) -> str:
@@ -370,7 +373,10 @@ async def spawn_and_run_isolated(
         servers: Comma-separated MCP server names.
         model: Override LLM model.
         timeout_seconds: Max execution time (default 120).
-        role: Role label for tracking.
+        role: Display label for tracking (NOT the agent's identity).
+        agent_name: Optional explicit unique identity. If omitted, a unique
+            name is auto-generated from ``role`` (e.g. "Riley [researcher]").
+            Must be unique across live agents and stored definitions.
         lifecycle: "oneshot" | "resumable". (Legacy "persistent" still
             accepted and coerced to "resumable" for backward compat.)
         skills: Comma-separated skill names.
@@ -382,6 +388,25 @@ async def spawn_and_run_isolated(
     if lifecycle == "persistent":
         lifecycle = "resumable"
 
+    # Resolve a UNIQUE identity up front. ``role`` is a display label, never
+    # the identity — an explicit agent_name is validated for uniqueness, else
+    # a unique name is generated from the role. This is the isolated-spawn
+    # creation gate (resume/restart paths reuse an existing record's name and
+    # do not pass through here).
+    try:
+        if agent_name:
+            # No db_path passed: _collect_taken_names falls back to
+            # os.environ["SPAWN_REGISTRY_DB"], which is the canonical handle for
+            # the agent_definitions table here (the isolated path has no
+            # per-server db_path of its own). spawn_agent passes db_path
+            # explicitly only because it already holds one.
+            ensure_unique_agent_name(agent_name, registry=_registry)
+            resolved_name = agent_name
+        else:
+            resolved_name = _generate_unique_agent_name(role or "agent", _registry)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
     result = await run_isolated_agent(
         task=task,
         project_dir=str(_PROJECT_DIR),
@@ -391,6 +416,7 @@ async def spawn_and_run_isolated(
         model=model,
         timeout_seconds=timeout_seconds,
         role=role,
+        agent_name=resolved_name,
         lifecycle=lifecycle,
         registry=_registry,
         display_manager=_display,
@@ -947,6 +973,11 @@ def spawn_agent(
                     ),
                 }
             )
+
+        # Front-line uniqueness gate across live registry + team sessions +
+        # persistent definitions. ``_persist_dynamic_agent_to_db`` still has
+        # its own UNIQUE-on-INSERT backstop for the agent_definitions table.
+        ensure_unique_agent_name(name, registry=_registry, db_path=db_path)
 
         _persist_dynamic_agent_to_db(
             db_path=db_path,

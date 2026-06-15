@@ -505,7 +505,10 @@ async def run_child_agent(
     max_depth = config.get("max_depth", 3)
     parent_run_id = config.get("parent_run_id", "")
     role = config.get("role", "agent")
-    agent_name = os.environ.get("TEAM_MY_NAME", "") or role
+    # Identity precedence: team env name > explicit config agent_name > role
+    # (legacy fallback). ``role`` is a display label, not an identity — the
+    # creation entry points now always pass a concrete, unique agent_name.
+    agent_name = os.environ.get("TEAM_MY_NAME", "") or config.get("agent_name") or role
     skill_names = config.get("skills", [])
 
     # Build system prompt with workspace awareness
