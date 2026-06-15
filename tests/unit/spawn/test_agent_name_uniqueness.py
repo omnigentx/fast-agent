@@ -90,3 +90,41 @@ def test_distinct_role_displays_unaffected(registry, monkeypatch):
         session_agents[name] = {"role": role_name}
 
     assert len(session_agents) == 3
+
+
+def test_every_team_call_site_passes_also_exclude():
+    """Static guard: pin the ACTUAL fix, not a hand-copied loop.
+
+    The loop-reproduction tests above validate `_generate_unique_agent_name`'s
+    contract, but they'd stay green if a future edit dropped
+    `also_exclude=set(session.agents)` from the real `spawn_team` /
+    `_spawn_single_agent` / `spawn_team_members_for_session` call sites. Parse
+    team_spawner.py and assert EVERY in-module call to the generator passes
+    `also_exclude` — so deleting the kwarg breaks this test, not just review.
+
+    Scope is team_spawner.py only: the standalone isolated-spawn call in
+    agent_spawner_server.py has no session batch and intentionally omits it.
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(team_spawner)
+    tree = ast.parse(src)
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_generate_unique_agent_name"
+    ]
+    assert len(calls) == 3, (
+        f"expected 3 generator call sites in team_spawner.py, found {len(calls)} "
+        "— update this guard if a call site was added/removed"
+    )
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "also_exclude" in kwargs, (
+            f"_generate_unique_agent_name call at line {call.lineno} dropped "
+            "also_exclude — two same-role_display agents can collide again"
+        )

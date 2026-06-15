@@ -54,12 +54,12 @@ from fast_agent.spawn.spawn_display import get_display_manager
 from fast_agent.spawn.spawn_registry import SpawnRegistry
 from fast_agent.spawn.team_spawner import (
     _generate_unique_agent_name,
-    _get_store as _get_team_store,
     ensure_unique_agent_name,
-)
-from fast_agent.spawn.team_spawner import (
     get_team_session,
     list_team_sessions,
+)
+from fast_agent.spawn.team_spawner import (
+    _get_store as _get_team_store,
 )
 from fast_agent.spawn.team_spawner import (
     list_team_templates as _list_templates,
@@ -395,6 +395,11 @@ async def spawn_and_run_isolated(
     # do not pass through here).
     try:
         if agent_name:
+            # No db_path passed: _collect_taken_names falls back to
+            # os.environ["SPAWN_REGISTRY_DB"], which is the canonical handle for
+            # the agent_definitions table here (the isolated path has no
+            # per-server db_path of its own). spawn_agent passes db_path
+            # explicitly only because it already holds one.
             ensure_unique_agent_name(agent_name, registry=_registry)
             resolved_name = agent_name
         else:
