@@ -188,6 +188,63 @@ async def test_execute_on_server_uses_meta_for_call_tool() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_on_server_stamps_caller_agent_on_call_tool() -> None:
+    """fast-agent stamps the calling agent's own name as ``caller_agent`` on every
+    tool call (so a pooled server can scope each op to the right agent's silo)."""
+    session = _RecordingSession()
+    aggregator = MCPAggregator(server_names=[], connection_persistence=True, context=None)
+    aggregator.agent_name = "PlannerAgent"
+    setattr(aggregator, "_persistent_connection_manager", _FakeConnectionManager(session))
+
+    await aggregator._execute_on_server(
+        server_name="demo", operation_type="tools/call", operation_name="echo",
+        method_name="call_tool", method_args={"name": "echo", "arguments": {}},
+    )
+    assert session.last_kwargs is not None
+    assert session.last_kwargs["meta"]["caller_agent"] == "PlannerAgent"
+
+
+@pytest.mark.asyncio
+async def test_caller_agent_overrides_inbound_meta_and_keeps_other_keys() -> None:
+    """``caller_agent`` is authoritative — an inbound (LLM-influenced) value is
+    OVERRIDDEN by the aggregator's own identity, so an agent can't impersonate
+    another. Other inbound meta keys are preserved."""
+    session = _RecordingSession()
+    aggregator = MCPAggregator(server_names=[], connection_persistence=True, context=None)
+    aggregator.agent_name = "PlannerAgent"
+    setattr(aggregator, "_persistent_connection_manager", _FakeConnectionManager(session))
+
+    token = _mcp_metadata_var.set({"caller_agent": "VictimAgent", "trace": "t1"})
+    try:
+        await aggregator._execute_on_server(
+            server_name="demo", operation_type="tools/call", operation_name="echo",
+            method_name="call_tool", method_args={"name": "echo", "arguments": {}},
+        )
+    finally:
+        _mcp_metadata_var.reset(token)
+    meta = session.last_kwargs["meta"]
+    assert meta["caller_agent"] == "PlannerAgent"   # not VictimAgent
+    assert meta["trace"] == "t1"                     # untouched
+
+
+@pytest.mark.asyncio
+async def test_no_caller_agent_stamped_when_aggregator_unnamed() -> None:
+    """An unnamed aggregator stamps nothing — owner-scoped tools then REJECT the
+    call rather than mis-attributing it (the skip is logged for debuggability)."""
+    session = _RecordingSession()
+    aggregator = MCPAggregator(server_names=[], connection_persistence=True, context=None)
+    aggregator.agent_name = None
+    setattr(aggregator, "_persistent_connection_manager", _FakeConnectionManager(session))
+
+    await aggregator._execute_on_server(
+        server_name="demo", operation_type="tools/call", operation_name="echo",
+        method_name="call_tool", method_args={"name": "echo", "arguments": {}},
+    )
+    meta = session.last_kwargs.get("meta") or {}
+    assert "caller_agent" not in meta
+
+
+@pytest.mark.asyncio
 async def test_execute_on_server_uses_meta_for_read_resource() -> None:
     session = _RecordingSession()
     aggregator = MCPAggregator(server_names=[], connection_persistence=True, context=None)
