@@ -1080,7 +1080,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
             emit_event(
                 "tool_result",
                 run_id,
-                role,
+                agent_name,
                 tool_name=tool_name,
                 status=status,
                 duration_ms=round(duration_ms, 1),
@@ -1109,7 +1109,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
         rp = getattr(runner, "request_params", None)
         if rp:
             model = getattr(rp, "model", "") or ""
-        emit_event("thinking", run_id, role, model=model)
+        emit_event("thinking", run_id, agent_name, model=model)
 
     async def spawn_after_llm(runner: Any, message: Any) -> None:
         """Emit 'response' event after each LLM reply, including reasoning."""
@@ -1167,7 +1167,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
             pass  # still emit token_usage below
         else:
             emit_event(
-                "response", run_id, role,
+                "response", run_id, agent_name,
                 text=text,
                 reasoning=reasoning_text,
                 stop_reason=stop_reason,
@@ -1184,7 +1184,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
                 _last = _acc.turns[-1]
                 _cache = getattr(_last, "cache_usage", None)
                 emit_event(
-                    "token_usage", run_id, role,
+                    "token_usage", run_id, agent_name,
                     model=getattr(_last, "model", "") or "",
                     input_tokens=getattr(_last, "input_tokens", 0),
                     output_tokens=getattr(_last, "output_tokens", 0),

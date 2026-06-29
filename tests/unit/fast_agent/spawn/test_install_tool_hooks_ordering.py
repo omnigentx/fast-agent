@@ -196,3 +196,42 @@ async def test_before_tool_propagates_pause_exception():
     with pytest.raises(RuntimeError, match="pause-protected"):
         await merged(None, None)
     assert order == ["pause"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_lifecycle_hooks_resolve_agent_name_without_nameerror(monkeypatch):
+    """Installing then INVOKING the spawn before/after-LLM hooks must not raise.
+
+    Regression for an incomplete ``role``→``agent_name`` rename that left a stale
+    ``role`` reference inside these closures (``emit_event("thinking"/"response"/
+    "token_usage", run_id, role, ...)``). It only surfaced at the first LLM turn of
+    a real subprocess — the merge-builder unit tests above passed because they feed
+    mock leaf hooks. This drives the REAL leaf closures so a future rename that
+    misses one fails here, fast, instead of only in the e2e team-spawn suite.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import fast_agent.spawn.isolated_runner as ir
+    from fast_agent.agents.tool_runner import ToolRunnerHooks
+
+    events: list[tuple] = []
+    monkeypatch.setattr(ir, "emit_event", lambda event, run_id, name, **kw: events.append((event, name)))
+
+    child = MagicMock()
+    child.tool_runner_hooks = None              # → "fresh" hook-install branch
+    child.message_history = []
+    app = {"DevAgent": child}
+
+    ir._install_tool_hooks(app, "run-9", "DevAgent")
+
+    hooks = child.tool_runner_hooks
+    assert isinstance(hooks, ToolRunnerHooks)
+    runner = SimpleNamespace(request_params=SimpleNamespace(model="m"))
+    # Each of these runs a real leaf closure that referenced the renamed variable:
+    await hooks.before_llm_call(runner, [])                       # spawn_before_llm → "thinking"
+    await hooks.after_llm_call(runner, SimpleNamespace(stop_reason="", content=[]))  # spawn_after_llm → "response"
+
+    emitted = {e for e, _ in events}
+    assert "thinking" in emitted and "response" in emitted
+    assert all(name == "DevAgent" for _, name in events)         # agent_name resolved correctly
