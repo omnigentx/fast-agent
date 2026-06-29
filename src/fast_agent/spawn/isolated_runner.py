@@ -457,7 +457,7 @@ async def _save_agent_context_snapshot(
         # the AgentApp itself which has no message_history.
         child_agent = agent
         try:
-            child_agent = agent["child"]
+            child_agent = agent[agent_name]
         except (KeyError, TypeError):
             pass  # Already a raw agent or doesn't support __getitem__
 
@@ -587,7 +587,11 @@ async def run_child_agent(
         history_file = config.get("history_file")
 
         @fast.agent(
-            name="child",
+            # Name the agent with its REAL identity (not a generic "child"): this
+            # flows to MCPAggregator.agent_name → the caller_agent stamped on
+            # every tool call → per-agent memory ownership. The app is keyed by
+            # this name, so the accessors below use agent_name too.
+            name=agent_name,
             instruction=full_instruction,
             servers=servers if servers else [],
             skills=skill_manifests,
@@ -614,7 +618,7 @@ async def run_child_agent(
                     )
 
                     try:
-                        load_history_into_agent(agent["child"], Path(history_file))
+                        load_history_into_agent(agent[agent_name], Path(history_file))
                         logger.info(
                             "📂 Loaded previous history from %s",
                             history_file,
@@ -837,7 +841,7 @@ async def run_child_agent(
 # ── Runtime config emission ────────────────────────────────────────
 
 
-def _emit_runtime_config(agent_app: Any, run_id: str, role: str) -> None:
+def _emit_runtime_config(agent_app: Any, run_id: str, agent_name: str) -> None:
     """Emit resolved runtime config from the live agent for dashboard monitoring.
 
     Reads the fully-initialized agent to extract:
@@ -846,7 +850,7 @@ def _emit_runtime_config(agent_app: Any, run_id: str, role: str) -> None:
     - per-server tool lists (name + description)
     """
     try:
-        child_agent = agent_app["child"]
+        child_agent = agent_app[agent_name]
     except (KeyError, TypeError):
         return
 
@@ -880,7 +884,7 @@ def _emit_runtime_config(agent_app: Any, run_id: str, role: str) -> None:
         emit_event(
             "runtime_config",
             run_id,
-            role,
+            agent_name,
             resolved_instruction=resolved_instruction,
             skills=skills_data,
             tools=tools_data,
@@ -890,7 +894,7 @@ def _emit_runtime_config(agent_app: Any, run_id: str, role: str) -> None:
         pass  # Never crash the child for monitoring
 
 
-async def _emit_mcp_status(agent_app: Any, run_id: str, role: str) -> None:
+async def _emit_mcp_status(agent_app: Any, run_id: str, agent_name: str) -> None:
     """Emit MCP health status using real runtime data from MCPAggregator.
 
     Calls collect_server_status() on the live aggregator to get actual
@@ -898,7 +902,7 @@ async def _emit_mcp_status(agent_app: Any, run_id: str, role: str) -> None:
     set subtraction.
     """
     try:
-        child_agent = agent_app["child"]
+        child_agent = agent_app[agent_name]
     except (KeyError, TypeError):
         return
 
@@ -945,7 +949,7 @@ async def _emit_mcp_status(agent_app: Any, run_id: str, role: str) -> None:
         emit_event(
             "mcp_status",
             run_id,
-            role,
+            agent_name,
             total_configured=total_configured,
             total_connected=total_connected,
             total_failed=total_failed,
@@ -958,13 +962,13 @@ async def _emit_mcp_status(agent_app: Any, run_id: str, role: str) -> None:
 # ── Tool-call event hooks ──────────────────────────────────────────
 
 
-def _install_tool_hooks(agent_app: Any, run_id: str, role: str) -> None:
+def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
     """Set ToolRunnerHooks on the child agent for TUI event emission.
 
     Uses fast-agent's built-in hook mechanism — zero fork changes needed.
     """
     try:
-        child_agent = agent_app["child"]
+        child_agent = agent_app[agent_name]
     except (KeyError, TypeError):
         return
 
@@ -1000,7 +1004,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, role: str) -> None:
             emit_event(
                 "message_turn",
                 run_id,
-                role,
+                agent_name,
                 turn_idx=idx,
                 msg_role=payload.get("role"),
                 message=payload,
@@ -1045,7 +1049,7 @@ def _install_tool_hooks(agent_app: Any, run_id: str, role: str) -> None:
             emit_event(
                 "tool_call",
                 run_id,
-                role,
+                agent_name,
                 tool_name=tool_name,
                 args_preview=args_preview,
                 args_full=args_full,

@@ -1775,6 +1775,26 @@ class MCPAggregator(ContextDependent):
 
                     metadata = _mcp_metadata_var.get()
 
+                # Stamp the CALLING agent's identity onto tool calls — trusted,
+                # transport-level _meta set by fast-agent (NOT an LLM-visible
+                # argument, so it can't be spoofed). Lets a tool know who invoked
+                # it; the memory server uses it to scope every op to the caller's
+                # own silo even when the server subprocess is pooled across
+                # in-process agents. Authoritative: overrides any inbound value.
+                if method_name == "call_tool":
+                    if self.agent_name:
+                        metadata = dict(metadata or {})
+                        metadata["caller_agent"] = self.agent_name
+                    else:
+                        # No identity to stamp → owner-scoped tools (e.g. memory)
+                        # will REJECT this call rather than mis-attribute it. Log
+                        # so a mis-constructed aggregator (name=None) is debuggable
+                        # instead of silently producing owner-less ops.
+                        logger.debug(
+                            f"call_tool '{operation_name}' on '{server_name}' has no "
+                            "agent_name to stamp as caller_agent"
+                        )
+
                 # Prepare kwargs
                 kwargs = method_args or {}
                 if metadata:

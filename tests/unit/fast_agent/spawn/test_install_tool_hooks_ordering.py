@@ -25,7 +25,23 @@ from fast_agent.spawn.isolated_runner import (
     _build_merged_before_llm_existing,
     _build_merged_before_llm_fresh,
     _build_merged_before_tool,
+    _install_tool_hooks,
 )
+
+
+def test_install_tool_hooks_keys_agent_app_by_agent_name():
+    """A spawned agent is looked up in the AgentApp by its REAL ``agent_name``
+    (not the old hard-coded ``"child"``). Regression for the rename that gives
+    every spawned agent its own caller-identity / memory silo."""
+    accessed: list[str] = []
+
+    class _FakeApp:
+        def __getitem__(self, key: str) -> object:
+            accessed.append(key)
+            return object()   # no ``tool_runner_hooks`` → helper returns cleanly
+
+    _install_tool_hooks(_FakeApp(), "run-1", "DevAgent")
+    assert accessed == ["DevAgent"]   # NOT "child"
 
 
 async def _record(name: str, sink: list[str]):
