@@ -603,6 +603,22 @@ async def run_child_agent(
             async with fast.run() as agent:
                 _install_tool_hooks(agent, event_run_id, agent_name)
 
+                # Self-compaction parity with in-process agents (server.py attaches
+                # this to every in-process agent). A spawned agent runs its OWN long
+                # conversation in this subprocess, so without this its message_history
+                # grows unbounded — only in-process agents compacted before. The
+                # backend is importable here (PYTHONPATH=project_dir; see the
+                # context_persistence import below), so we reuse the exact same hook;
+                # merge_hooks keeps the pause-first ordering and OR-merges the
+                # on_context_overflow handler. Best-effort: a pure fast-agent install
+                # (no backend) just skips it.
+                try:
+                    from services.context_compaction import attach_compaction_hooks_to_all
+                    if attach_compaction_hooks_to_all(agent):
+                        logger.info("[COMPACT] compaction hook attached to spawned agent %s", agent_name)
+                except Exception:
+                    logger.debug("[COMPACT] compaction unavailable in spawned process", exc_info=True)
+
                 # Signal that agent is ready (MCP servers loaded, hooks installed)
                 emit_event("agent_ready", event_run_id, agent_name)
 
