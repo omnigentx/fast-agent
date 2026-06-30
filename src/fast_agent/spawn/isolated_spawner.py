@@ -210,6 +210,17 @@ async def _run_subprocess(
     if env_vars:
         subprocess_env.update(env_vars)
 
+    # The runner chdir's into the agent workspace, but core.database resolves its
+    # RELATIVE sqlite path against the CWD at connect time — so config_service
+    # (e.g. context-compaction settings) would read a stray workspace DB and fall
+    # back to defaults instead of the backend's tuned values. Pin core.database to
+    # the same absolute DB the backend + spawn registry already use.
+    subprocess_env.setdefault(
+        "JARVIS_DB_PATH",
+        subprocess_env.get("SPAWN_REGISTRY_DB")
+        or os.path.join(str(project_path), "data", "jarvis.db"),
+    )
+
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(project_path),
