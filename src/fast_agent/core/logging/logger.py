@@ -22,7 +22,6 @@ from fast_agent.core.logging.listeners import (
     ProgressListener,
 )
 from fast_agent.core.logging.transport import AsyncEventBus, EventTransport
-from fast_agent.utils.async_utils import ensure_event_loop
 
 
 class Logger:
@@ -37,20 +36,36 @@ class Logger:
         self.event_bus = AsyncEventBus.get()
 
     def _emit_event(self, event: Event) -> None:
-        """Emit an event by running it in the event loop."""
+        """Emit on the event bus loop, including calls from stderr reader threads."""
         # AsyncEventBus is a singleton that tests may reset between runs.
         # Logger instances are cached globally and can therefore outlive a bus
         # reset. Always re-resolve the current bus before emitting to avoid
         # dispatching to a stale, stopped bus instance.
         self.event_bus = AsyncEventBus.get()
 
-        loop = ensure_event_loop()
-        if loop.is_running():
-            # If we're in a thread with a running loop, schedule the coroutine
-            asyncio.create_task(self.event_bus.emit(event))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # MCP stdio stderr is read on a worker thread. Creating a loop there
+            # can change the process-wide uvloop policy while the main loop is
+            # starting other MCP subprocesses, breaking their child watcher.
+            task = self.event_bus._task
+            if task is None:
+                return
+            loop = task.get_loop()
+            if loop.is_closed() or not loop.is_running():
+                return
+            future = asyncio.run_coroutine_threadsafe(self.event_bus.emit(event), loop)
+
+            def report_failure(completed: Any) -> None:
+                try:
+                    completed.result()
+                except Exception:
+                    logging.getLogger(__name__).exception("Event bus emit failed")
+
+            future.add_done_callback(report_failure)
         else:
-            # If no loop is running, run it until the emit completes
-            loop.run_until_complete(self.event_bus.emit(event))
+            loop.create_task(self.event_bus.emit(event))
 
     @staticmethod
     def _coerce_exc_info(data: dict[str, Any]) -> dict[str, Any]:
