@@ -174,7 +174,7 @@ def _notify_meeting_started(
 
 
 def _notify_meeting_ended(
-    meeting_id: str, agent_name: str, agenda: str
+    meeting_id: str, agent_name: str, agenda: str, *, wake: bool = True
 ) -> None:
     """Send meeting-ended notification with full transcript."""
     bus = _get_bus()
@@ -197,7 +197,8 @@ def _notify_meeting_ended(
         content=msg,
         message_type="meeting_ended",
     )
-    _auto_wake_if_idle(agent_name)
+    if wake:
+        _auto_wake_if_idle(agent_name)
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -805,8 +806,91 @@ async def get_meeting_status(meeting_id: str) -> str:
             "participants": participants,
             "joined": state.get("joined", []),
             "transcript_length": len(transcript),
+            "turn_wait_seconds": (
+                max(0, int(time.time() - state["turn_started_at"]))
+                if not state.get("ended") and isinstance(state.get("turn_started_at"), (int, float))
+                else None
+            ),
         }
     )
+
+
+STALL_RECOVERY_SECONDS = 600
+
+
+@mcp.tool()
+async def end_meeting(meeting_id: str, reason: str, my_name: str = "") -> str:
+    """Close a stalled meeting as its original chair, with an audit trail.
+
+    Only the verified creator may recover a meeting, and only after its
+    current speaker has held the turn for at least ten minutes. This ends
+    the meeting without speaking or skipping on the absent agent's behalf.
+    All participants retain the transcript and can continue work outside
+    the meeting. Their inbox gets an informational close notice without
+    starting a fresh LLM run.
+    """
+    my_name, identity_error = _assert_self_identity(my_name)
+    if identity_error:
+        return identity_error
+    if not reason.strip():
+        return json.dumps({"error": "A recovery reason is required."})
+    if not _storage.meeting_exists(meeting_id):
+        return json.dumps({"error": f"Meeting '{meeting_id}' not found"})
+
+    config = _storage.get_config(meeting_id) or {}
+    if my_name != config.get("created_by"):
+        return json.dumps({"error": "Only the meeting chair may end a stalled meeting."})
+
+    with _storage.acquire_lock(meeting_id) as conn:
+        state = _storage.get_state(meeting_id, _conn=conn) or {}
+        if state.get("ended"):
+            return json.dumps({"error": "Meeting already ended"})
+        participants = state.get("participants", [])
+        turn = state.get("current_turn", 0)
+        if not isinstance(turn, int) or not 0 <= turn < len(participants):
+            return json.dumps({"error": "Invalid meeting turn; manual review required."})
+        speaker = participants[turn]
+        if speaker == my_name:
+            return json.dumps({"error": "It is your turn; use speak or skip_turn."})
+        started_at = state.get("turn_started_at")
+        if not isinstance(started_at, (int, float)):
+            return json.dumps({"error": "Turn start time unavailable; manual review required."})
+        wait_seconds = max(0, time.time() - started_at)
+        if wait_seconds < STALL_RECOVERY_SECONDS:
+            return json.dumps({
+                "error": "Current speaker is still within the response window.",
+                "current_speaker": speaker,
+                "turn_wait_seconds": int(wait_seconds),
+                "recovery_after_seconds": STALL_RECOVERY_SECONDS,
+            })
+
+        entry = {
+            "turn": len(_storage.get_transcript(meeting_id, _conn=conn)) + 1,
+            "round": state.get("current_round", 1),
+            "agent": my_name,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "message": f"Chair closed stalled meeting; waiting on {speaker}. Reason: {reason.strip()}",
+            "type": "recovery",
+        }
+        _storage.append_transcript(meeting_id, entry, _conn=conn)
+        state["ended"] = True
+        state["outcome"] = "stalled_turn_recovered"
+        state["ended_by"] = my_name
+        state["stalled_speaker"] = speaker
+        _storage.update_state(meeting_id, state, _conn=conn)
+
+    _audit(meeting_id, entry["message"])
+    _fire_hook("on_transcript_entry", meeting_id, entry)
+    _fire_hook("on_meeting_ended", meeting_id, "stalled_turn_recovered")
+    _fire_hook("on_state_changed", meeting_id, state)
+    for participant in participants:
+        _notify_meeting_ended(meeting_id, participant, config.get("agenda", ""), wake=False)
+    return json.dumps({
+        "status": "ended",
+        "outcome": "stalled_turn_recovered",
+        "current_speaker": speaker,
+        "turn_wait_seconds": int(wait_seconds),
+    })
 
 
 @mcp.tool()

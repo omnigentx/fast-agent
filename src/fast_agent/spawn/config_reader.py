@@ -6,6 +6,7 @@ All spawn modules should import from here instead of hardcoding server lists.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -92,9 +93,25 @@ def get_server_env(
     if registry_db:
         env["SPAWN_REGISTRY_DB"] = registry_db
 
-    # NOTE: TEAM_ROLES_CONFIG is NOT propagated here because it's a large
-    # JSON blob that breaks YAML string concatenation in isolated_runner.
-    # MCP servers inherit it from process environment instead.
+    # MCP subprocesses receive an explicit env mapping; they do not inherit
+    # TEAM_ROLES_CONFIG from the agent process. Pass only the addressing data
+    # needed by team tools, not the large instructions/server definitions.
+    roles_json = os.environ.get("TEAM_ROLES_CONFIG", "")
+    if roles_json:
+        try:
+            roles = json.loads(roles_json)
+            if isinstance(roles, dict):
+                roster = {
+                    str(role): {"agent_name": cfg["agent_name"]}
+                    for role, cfg in roles.items()
+                    if isinstance(cfg, dict)
+                    and isinstance(cfg.get("agent_name"), str)
+                    and cfg["agent_name"].strip()
+                }
+                if roster:
+                    env["TEAM_ROLES_CONFIG"] = json.dumps(roster, ensure_ascii=False)
+        except (TypeError, ValueError):
+            logger.warning("Invalid TEAM_ROLES_CONFIG; team recipient resolution unavailable")
 
     return env if env else None
 

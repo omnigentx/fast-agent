@@ -58,6 +58,10 @@ def test_auto_detected_sender_is_canonical_and_cc_self_is_removed(monkeypatch):
     bus.send.return_value = SimpleNamespace(message_id="msg-1")
     monkeypatch.setattr(email_server, "get_bus", lambda: bus)
     monkeypatch.setattr(email_server, "auto_wake_if_idle", lambda _name: None)
+    monkeypatch.setattr(email_server, "get_team_config", lambda: {
+        "pm": {"agent_name": "Bennett [PM]"},
+        "dev": {"agent_name": "Taylor [Dev]"},
+    })
 
     result = json.loads(
         email_server.send_email(
@@ -71,3 +75,39 @@ def test_auto_detected_sender_is_canonical_and_cc_self_is_removed(monkeypatch):
     assert "cc_sent" not in result
     bus.send.assert_called_once()
     assert bus.send.call_args.kwargs["from_name"] == "Bennett [PM]"
+
+
+def test_unknown_recipient_rejects_entire_batch_without_orphan_inbox(monkeypatch):
+    monkeypatch.setenv("TEAM_MY_NAME", "Bennett [PM]")
+    bus = Mock()
+    monkeypatch.setattr(email_server, "get_bus", lambda: bus)
+    monkeypatch.setattr(email_server, "get_team_config", lambda: {
+        "pm": {"agent_name": "Bennett [PM]"},
+        "dev": {"agent_name": "Taylor [Dev]"},
+    })
+    result = json.loads(email_server.send_email(
+        to="Taylor [Dev], Jarvis", body="Please review",
+    ))
+    assert result["unknown_recipients"] == ["Jarvis"]
+    bus.send.assert_not_called()
+
+
+def test_cc_is_persisted_without_waking_idle_agent(monkeypatch):
+    monkeypatch.setenv("TEAM_MY_NAME", "Bennett [PM]")
+    bus = Mock()
+    bus.send.return_value = SimpleNamespace(message_id="msg-1")
+    wake = Mock()
+    monkeypatch.setattr(email_server, "get_bus", lambda: bus)
+    monkeypatch.setattr(email_server, "auto_wake_if_idle", wake)
+    monkeypatch.setattr(email_server, "get_team_config", lambda: {
+        "pm": {"agent_name": "Bennett [PM]"},
+        "dev": {"agent_name": "Taylor [Dev]"},
+        "qe": {"agent_name": "Parker [QE]"},
+    })
+    result = json.loads(email_server.send_email(
+        to="dev", cc="Parker [QE], DEV", body="Status update",
+    ))
+    assert result["sent"][0]["to"] == "Taylor [Dev]"
+    assert result["cc_sent"][0]["to"] == "Parker [QE]"
+    assert bus.send.call_count == 2
+    wake.assert_called_once_with("Taylor [Dev]")

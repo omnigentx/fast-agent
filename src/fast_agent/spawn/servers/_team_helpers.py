@@ -212,6 +212,31 @@ def auto_wake_if_idle(agent_name: str) -> None:
     """
     from fast_agent.spawn.agent_channel import AgentChannel
 
+    # Backend restarts can leave a paused team member without a live child
+    # process. Pause intent lives in the shared SQLite DB, not in the socket
+    # liveness probe. A queued message must never silently disarm that pause
+    # by spawning a fresh paid LLM run.
+    db_path = os.environ.get("SPAWN_REGISTRY_DB", "")
+    if db_path:
+        import sqlite3
+
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3) as conn:
+                paused = conn.execute(
+                    "SELECT 1 FROM agent_pause_state WHERE agent_name = ? LIMIT 1",
+                    (agent_name,),
+                ).fetchone()
+            if paused:
+                logger.info("[AUTO-WAKE] %s remains paused; inbox delivery deferred", agent_name)
+                return
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                logger.error(
+                    "[AUTO-WAKE] Cannot verify pause state for %s: %s; refusing wake",
+                    agent_name, exc,
+                )
+                return
+
     try:
         alive = AgentChannel.is_alive(agent_name)
     except Exception as e:
@@ -338,4 +363,3 @@ def _respawn_dead_agent(agent_name: str) -> None:
         "📬 Respawning dead agent %s via spawner (prev run_id=%s)",
         agent_name, record.run_id,
     )
-
