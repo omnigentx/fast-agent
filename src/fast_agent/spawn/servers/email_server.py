@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from fast_agent.spawn.servers._team_helpers import (
+    assert_self_identity,
     auto_wake_if_idle,
     get_bus,
-    get_my_name,
     get_team_config,
     parse_recipients,
 )
@@ -66,23 +67,31 @@ def send_email(
     if not bus:
         return json.dumps({"error": "No workspace configured. Cannot send emails."})
 
-    my_name = my_name or get_my_name()
+    resolved_name, identity_error = assert_self_identity(my_name)
+    if identity_error:
+        return identity_error
+    # Use the authoritative process identity after validation. The helper
+    # accepts harmless case/whitespace differences in the claim, but those
+    # differences must not bypass the self-recipient check below.
+    my_name = os.environ.get("TEAM_MY_NAME", "").strip() or resolved_name
     recipients = parse_recipients(to)
     if not recipients:
         return json.dumps({"error": "'to' must specify at least one recipient."})
 
     # Guard: reject self-messaging
-    recipients = [r for r in recipients if r != my_name]
+    recipients = [r for r in recipients if r.casefold() != my_name.casefold()]
     if not recipients:
         teammates = [
             cfg.get("agent_name", "")
             for cfg in get_team_config().values()
-            if cfg.get("agent_name") != my_name
+            if cfg.get("agent_name", "").casefold() != my_name.casefold()
         ]
-        return json.dumps({
-            "error": "Cannot send email to yourself. Use send_email to contact teammates.",
-            "available_teammates": teammates,
-        })
+        return json.dumps(
+            {
+                "error": "Cannot send email to yourself. Use send_email to contact teammates.",
+                "available_teammates": teammates,
+            }
+        )
 
     # Apply no-reply prefix
     email_body = f"[NO REPLY NEEDED]\n{body}" if no_reply else body
@@ -111,7 +120,9 @@ def send_email(
 
     # CC recipients — informational copy
     cc_recipients = parse_recipients(cc) if cc else []
-    cc_recipients = [r for r in cc_recipients if r != my_name and r not in recipients]
+    cc_recipients = [
+        r for r in cc_recipients if r.casefold() != my_name.casefold() and r not in recipients
+    ]
     cc_sent: list[dict[str, str]] = []
     if cc_recipients:
         to_names = ", ".join(recipients)
@@ -147,7 +158,6 @@ def send_email(
         result["cc_sent"] = cc_sent
         result["note"] += f" CC: {', '.join(r['to'] for r in cc_sent)}."
     return json.dumps(result)
-
 
 
 def _get_recent_activities(run_id: str, limit: int = 3) -> list[dict]:
@@ -195,8 +205,6 @@ def _get_recent_activities(run_id: str, limit: int = 3) -> list[dict]:
         return activities
     except Exception:
         return []
-
-
 
 
 if __name__ == "__main__":
