@@ -1337,6 +1337,19 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
             on_pause_cancel=pause_cancel,
         )
 
+    # Optional host integration. The spawned process has its own agent object,
+    # so only this boundary can attach a host's per-call model hook before the
+    # first LLM request. Plain fast-agent installations have no Jarvis package.
+    from importlib import import_module
+
+    try:
+        host_models = import_module("services.team_model_runtime")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"services", "services.team_model_runtime"}:
+            raise
+    else:
+        host_models.attach_model_hook(agent_app, run_id, agent_name, emit_event)
+
 
 async def _chain_before_llm(spawn_fn: Any, rtac_fn: Any, runner: Any, messages: Any) -> None:
     """Chain spawn_before_llm and RTAC before_llm hooks."""
