@@ -43,6 +43,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from fast_agent.spawn.config_reader import get_available_servers
+from fast_agent.spawn.context_snapshot_store import load_latest_context_json
 from fast_agent.spawn.isolated_spawner import (
     _check_and_resume_on_inbox,
     cancel_spawn,
@@ -597,6 +598,8 @@ async def restart_spawn(run_id: str) -> str:
         lifecycle=record.lifecycle,
         registry=_registry,
         display_manager=_display,
+        env_vars=env_vars_cfg,
+        skills=cfg.get("skills", []),
         spawn_lifecycle_hooks=_spawn_hooks,
         server_overrides=cfg.get("server_overrides") or None,
         session_id=restart_session_id,
@@ -673,8 +676,8 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
     # crashed agent, name mismatch, DB write failed) — surface that
     # loudly rather than papering it with a stale ``context``/``result``
     # text reconstruction the LLM can't meaningfully continue from.
-    from services.context_persistence import load_latest_context_json
-    snapshot_json = load_latest_context_json(agent_name)
+    session_id = (cfg.get("env_vars") or {}).get("TEAM_SESSION_ID")
+    snapshot_json = load_latest_context_json(agent_name, session_id=session_id)
     if not snapshot_json:
         return json.dumps({
             "error": (
@@ -1647,8 +1650,19 @@ async def send_team_message(
     if not pm_agent_name:
         return json.dumps({"error": "No PM/orchestrator found in this team session."})
 
-    # Send message via MessageBus
-    msg = _bus.send(
+    # Team agents read from a session-scoped inbox. The module-level bus is
+    # shared by non-team spawns and would silently queue this directive in a
+    # directory the PM never watches.
+    record = _registry.get_latest(pm_run_id) if pm_run_id else None
+    env_vars = (
+        record.original_config.get("env_vars", {})
+        if record and record.original_config else {}
+    )
+    messages_dir = env_vars.get("TEAM_MESSAGES_DIR") or str(
+        _PROJECT_DIR / ".runtime" / "state" / "messages" / session_id
+    )
+    team_bus = MessageBus(messages_dir=messages_dir)
+    msg = team_bus.send(
         from_name="Jarvis",
         to_name=pm_agent_name,
         content=message,
@@ -1666,24 +1680,18 @@ async def send_team_message(
     # the spawn record so the reader can locate the session-scoped
     # ``TEAM_MESSAGES_DIR``.
     woke = False
-    if pm_run_id:
-        record = _registry.get_latest(pm_run_id)
-        if record and record.status in ("idle", "completed"):
-            try:
-                await _check_and_resume_on_inbox(
-                    run_id=pm_run_id,
-                    agent_name=pm_agent_name,
-                    registry=_registry,
-                    display_manager=_display,
-                    env_vars=(
-                        record.original_config.get("env_vars")
-                        if record.original_config
-                        else None
-                    ),
-                )
-                woke = True
-            except Exception as e:
-                logger.warning("Failed to auto-wake PM: %s", e)
+    if record and record.status in ("idle", "completed"):
+        try:
+            await _check_and_resume_on_inbox(
+                run_id=pm_run_id,
+                agent_name=pm_agent_name,
+                registry=_registry,
+                display_manager=_display,
+                env_vars=env_vars or None,
+            )
+            woke = True
+        except Exception as e:
+            logger.warning("Failed to auto-wake PM: %s", e)
 
     return json.dumps({
         "status": "sent",
