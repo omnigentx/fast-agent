@@ -1647,8 +1647,19 @@ async def send_team_message(
     if not pm_agent_name:
         return json.dumps({"error": "No PM/orchestrator found in this team session."})
 
-    # Send message via MessageBus
-    msg = _bus.send(
+    # Team agents read from a session-scoped inbox. The module-level bus is
+    # shared by non-team spawns and would silently queue this directive in a
+    # directory the PM never watches.
+    record = _registry.get_latest(pm_run_id) if pm_run_id else None
+    env_vars = (
+        record.original_config.get("env_vars", {})
+        if record and record.original_config else {}
+    )
+    messages_dir = env_vars.get("TEAM_MESSAGES_DIR") or str(
+        _PROJECT_DIR / ".runtime" / "state" / "messages" / session_id
+    )
+    team_bus = MessageBus(messages_dir=messages_dir)
+    msg = team_bus.send(
         from_name="Jarvis",
         to_name=pm_agent_name,
         content=message,
@@ -1666,24 +1677,18 @@ async def send_team_message(
     # the spawn record so the reader can locate the session-scoped
     # ``TEAM_MESSAGES_DIR``.
     woke = False
-    if pm_run_id:
-        record = _registry.get_latest(pm_run_id)
-        if record and record.status in ("idle", "completed"):
-            try:
-                await _check_and_resume_on_inbox(
-                    run_id=pm_run_id,
-                    agent_name=pm_agent_name,
-                    registry=_registry,
-                    display_manager=_display,
-                    env_vars=(
-                        record.original_config.get("env_vars")
-                        if record.original_config
-                        else None
-                    ),
-                )
-                woke = True
-            except Exception as e:
-                logger.warning("Failed to auto-wake PM: %s", e)
+    if record and record.status in ("idle", "completed"):
+        try:
+            await _check_and_resume_on_inbox(
+                run_id=pm_run_id,
+                agent_name=pm_agent_name,
+                registry=_registry,
+                display_manager=_display,
+                env_vars=env_vars or None,
+            )
+            woke = True
+        except Exception as e:
+            logger.warning("Failed to auto-wake PM: %s", e)
 
     return json.dumps({
         "status": "sent",
