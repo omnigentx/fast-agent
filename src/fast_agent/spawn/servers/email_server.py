@@ -78,6 +78,41 @@ def send_email(
     if not recipients:
         return json.dumps({"error": "'to' must specify at least one recipient."})
 
+    team_config = get_team_config()
+    known_names = {
+        str(cfg.get("agent_name", role)).casefold(): str(cfg.get("agent_name", role))
+        for role, cfg in team_config.items() if isinstance(cfg, dict)
+    }
+    known_roles = {
+        str(role).casefold(): str(cfg.get("agent_name", role))
+        for role, cfg in team_config.items() if isinstance(cfg, dict)
+    }
+
+    def canonicalize(names: list[str]) -> tuple[list[str], list[str]]:
+        valid: list[str] = []
+        unknown: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            canonical = known_names.get(name.casefold()) or known_roles.get(name.casefold())
+            if canonical is None:
+                unknown.append(name)
+            elif canonical.casefold() not in seen:
+                valid.append(canonical)
+                seen.add(canonical.casefold())
+        return valid, unknown
+
+    recipients, unknown_to = canonicalize(recipients)
+    cc_recipients, unknown_cc = canonicalize(parse_recipients(cc) if cc else [])
+    if unknown_to or unknown_cc:
+        return json.dumps({
+            "error": "Unknown team recipient; no email was sent.",
+            "unknown_recipients": unknown_to + unknown_cc,
+            "available_teammates": [
+                name for name in known_names.values()
+                if name.casefold() != my_name.casefold()
+            ],
+        })
+
     # Guard: reject self-messaging
     recipients = [r for r in recipients if r.casefold() != my_name.casefold()]
     if not recipients:
@@ -119,9 +154,10 @@ def send_email(
         sent.append({"to": recipient, "message_id": msg.message_id, "type": "to"})
 
     # CC recipients — informational copy
-    cc_recipients = parse_recipients(cc) if cc else []
     cc_recipients = [
-        r for r in cc_recipients if r.casefold() != my_name.casefold() and r not in recipients
+        r for r in cc_recipients
+        if r.casefold() != my_name.casefold()
+        and r.casefold() not in {name.casefold() for name in recipients}
     ]
     cc_sent: list[dict[str, str]] = []
     if cc_recipients:
@@ -141,7 +177,8 @@ def send_email(
                     "no_reply": no_reply,
                 },
             )
-            auto_wake_if_idle(recipient)
+            # A CC is informational. Persist it for the recipient's next
+            # active turn, but do not start a new LLM run just to read it.
             cc_sent.append({"to": recipient, "message_id": msg.message_id, "type": "cc"})
 
     result: dict[str, Any] = {

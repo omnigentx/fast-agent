@@ -509,6 +509,10 @@ async def run_child_agent(
     # (legacy fallback). ``role`` is a display label, not an identity — the
     # creation entry points now always pass a concrete, unique agent_name.
     agent_name = os.environ.get("TEAM_MY_NAME", "") or config.get("agent_name") or role
+    # The saved original_config may contain a role template. Resolve identity
+    # at the child boundary so fresh spawns, restarts and every resume path
+    # receive the same concrete instruction.
+    instruction = instruction.replace("{agent_name}", agent_name)
     skill_names = config.get("skills", [])
 
     # Build system prompt with workspace awareness
@@ -758,7 +762,15 @@ async def run_child_agent(
                         # messages that arrived during agent.send (when sock
                         # was not yet listening), and post-wake messages.
                         unread = bus.read_unread(agent_name) if bus else []
-                        if unread:
+                        # Informational CCs are retained in the inbox until
+                        # an actionable message arrives. The safety timeout
+                        # below still reads the inbox periodically, but a CC
+                        # alone must never start another paid LLM turn.
+                        actionable = [
+                            msg for msg in unread
+                            if msg.message_type != "notification"
+                        ]
+                        if actionable:
                             # If we got here via timeout (not signal), the
                             # producer's wake signal was lost — surface so
                             # ops can investigate. Inbox-poll fallback
@@ -773,21 +785,42 @@ async def run_child_agent(
                                 )
                             last_was_timeout = False
 
-                            inbox_lines = [
-                                f"\n━━━ 📬 NEW MESSAGES ({len(unread)} unread) ━━━\n"
+                            informational = [
+                                msg for msg in unread
+                                if msg.message_type == "notification"
                             ]
+                            # Bound CC context when a long-idle agent later
+                            # receives real work. All entries are marked done;
+                            # the latest ten remain visible in this turn.
+                            kept_ids = {
+                                msg.message_id for msg in informational[-10:]
+                            }
+                            delivered = [
+                                msg for msg in unread
+                                if msg.message_type != "notification"
+                                or msg.message_id in kept_ids
+                            ]
+                            omitted = len(informational) - len(kept_ids)
+                            inbox_lines = [
+                                f"\n━━━ 📬 NEW MESSAGES ({len(delivered)} delivered) ━━━\n"
+                            ]
+                            if omitted:
+                                inbox_lines.append(
+                                    f"({omitted} older informational CCs omitted)\n"
+                                )
                             for msg in unread:
+                                bus.mark_done(agent_name, msg.message_id)
+                            for msg in delivered:
                                 inbox_lines.append(
                                     f"[{msg.message_type.upper()}] from {msg.from_name}:\n"
                                     f"  {msg.content}\n"
                                 )
-                                bus.mark_done(agent_name, msg.message_id)
                             inbox_lines.append(
                                 "→ Handle these messages: take action and/or reply.\n"
                                 "━━━━━━━━━━━━━━━━━━━━\n"
                             )
                             pending = "\n".join(inbox_lines)
-                            pending_msg_count = len(unread)
+                            pending_msg_count = len(delivered)
                             continue
 
                         # 4) Empty inbox — sleep waiting for wake signal.

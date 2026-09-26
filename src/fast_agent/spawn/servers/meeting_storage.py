@@ -47,15 +47,15 @@ class MeetingStorage(Protocol):
         """Return the meeting config dict, or ``None`` if not found."""
         ...
 
-    def get_state(self, meeting_id: str) -> dict | None:
+    def get_state(self, meeting_id: str, _conn=None) -> dict | None:
         """Return the current state dict, or ``None``."""
         ...
 
-    def get_transcript(self, meeting_id: str) -> list[dict]:
+    def get_transcript(self, meeting_id: str, _conn=None) -> list[dict]:
         """Return the full transcript (list of turn entries)."""
         ...
 
-    def update_state(self, meeting_id: str, state: dict) -> None:
+    def update_state(self, meeting_id: str, state: dict, _conn=None) -> None:
         """Overwrite the meeting state.
 
         Note: ``config_json`` is intentionally write-once (set during
@@ -68,7 +68,7 @@ class MeetingStorage(Protocol):
         """
         ...
 
-    def append_transcript(self, meeting_id: str, entry: dict) -> None:
+    def append_transcript(self, meeting_id: str, entry: dict, _conn=None) -> None:
         """Append a single entry to the transcript."""
         ...
 
@@ -161,26 +161,26 @@ class JsonFileMeetingStorage:
         raw = self._read_json(d / "config.json")
         return raw if isinstance(raw, dict) else {}
 
-    def get_state(self, meeting_id: str) -> dict | None:
+    def get_state(self, meeting_id: str, _conn=None) -> dict | None:
         d = self._meeting_dir(meeting_id)
         if not d.exists():
             return None
         raw = self._read_json(d / "state.json")
         return raw if isinstance(raw, dict) else {}
 
-    def get_transcript(self, meeting_id: str) -> list[dict]:
+    def get_transcript(self, meeting_id: str, _conn=None) -> list[dict]:
         d = self._meeting_dir(meeting_id)
         if not d.exists():
             return []
         raw = self._read_json(d / "transcript.json")
         return raw if isinstance(raw, list) else []
 
-    def update_state(self, meeting_id: str, state: dict) -> None:
+    def update_state(self, meeting_id: str, state: dict, _conn=None) -> None:
         self._write_json(
             self._meeting_dir(meeting_id) / "state.json", state
         )
 
-    def append_transcript(self, meeting_id: str, entry: dict) -> None:
+    def append_transcript(self, meeting_id: str, entry: dict, _conn=None) -> None:
         d = self._meeting_dir(meeting_id)
         transcript = self.get_transcript(meeting_id)
         transcript.append(entry)
@@ -494,4 +494,3 @@ class SqliteMeetingStorage:
             ]
         finally:
             conn.close()
-
