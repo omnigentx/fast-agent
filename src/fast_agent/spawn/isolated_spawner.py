@@ -1010,6 +1010,7 @@ async def _check_and_resume_on_inbox(
         registry=registry,
         display_manager=display_manager,
         env_vars=env_vars,
+        skills=cfg.get("skills", []),
         history_file=history_file,
         spawn_lifecycle_hooks=spawn_lifecycle_hooks,
         server_overrides=resume_server_overrides,

@@ -598,6 +598,8 @@ async def restart_spawn(run_id: str) -> str:
         lifecycle=record.lifecycle,
         registry=_registry,
         display_manager=_display,
+        env_vars=env_vars_cfg,
+        skills=cfg.get("skills", []),
         spawn_lifecycle_hooks=_spawn_hooks,
         server_overrides=cfg.get("server_overrides") or None,
         session_id=restart_session_id,

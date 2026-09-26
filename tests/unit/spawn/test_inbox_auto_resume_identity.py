@@ -54,6 +54,7 @@ def _make_record(
         "instruction": "old inst",
         "context": "old ctx",
         "servers": ["filesystem"],
+        "skills": ["dev-workflow", "engineering-principles"],
         "model": "",
         "timeout_seconds": 0,
         "role": "dev",
@@ -151,6 +152,9 @@ async def test_resume_forwards_team_identity_when_fresh(
     )
     assert kwargs.get("session_id") == "sess123", (
         "Fresh record: env.TEAM_SESSION_ID must propagate to the new run."
+    )
+    assert kwargs.get("skills") == ["dev-workflow", "engineering-principles"], (
+        "Skills must survive auto-resume because they enable the shell runtime."
     )
 
 
