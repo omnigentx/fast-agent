@@ -1,9 +1,9 @@
 """Snapshot loading must work in the standalone MCP subprocess."""
 
-import sqlite3
 import json
-from types import SimpleNamespace
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
