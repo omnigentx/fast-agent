@@ -1144,6 +1144,7 @@ async def run_isolated_agent_background(
         from fast_agent.spawn.spawn_registry import (
             Lifecycle,
             SpawnRecord,
+            _process_birth,
         )
 
         orig_cfg: dict[str, Any] = {}
@@ -1185,6 +1186,10 @@ async def run_isolated_agent_background(
             status="running",
             original_config=orig_cfg,
             session_id=session_id,
+            metadata={
+                "launch_owner_pid": os.getpid(),
+                "launch_owner_birth": _process_birth(os.getpid()),
+            } if session_id else {},
         )
         registry.register(record)
         # Hook: on_registered — agent is now in registry (background path)

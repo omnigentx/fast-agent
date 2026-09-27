@@ -276,6 +276,84 @@ def test_running_pid_must_belong_to_the_recorded_run(
         process.wait(timeout=5)
 
 
+@pytest.mark.asyncio
+async def test_restart_recovers_fresh_running_record_without_child_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One startup wake must recover a launch abandoned before PID storage."""
+    from fast_agent.spawn import isolated_spawner
+    from fast_agent.spawn.message_bus import MessageBus
+    from fast_agent.spawn.servers import _team_helpers
+    from fast_agent.spawn.spawn_registry import _process_birth
+
+    monkeypatch.setenv("SPAWN_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(tmp_path / "registry.db"))
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        registry = SpawnRegistry(tmp_path / "unused.json")
+        messages_dir = tmp_path / ".runtime" / "state" / "messages" / "team-a"
+        bus = MessageBus(messages_dir)
+        bus.send("Jarvis", "Alex [PM]", "Retry this revision")
+        registry.register(SpawnRecord(
+            run_id="orphan", agent_name="Alex [PM]", role="pm",
+            team_name="team-a", session_id="team-a", status="running",
+            pid=None, started_at=time.time(),
+            metadata={"launch_owner_pid": owner.pid,
+                      "launch_owner_birth": _process_birth(owner.pid)},
+            original_config={
+                "role": "pm", "team_name": "team-a",
+                "project_dir": str(tmp_path), "task": "initial task",
+                "env_vars": {"TEAM_SESSION_ID": "team-a",
+                             "TEAM_MESSAGES_DIR": str(messages_dir)},
+            },
+        ))
+        assert registry.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        registry._load()
+        correct_birth = registry._data["orphan"]["metadata"]["launch_owner_birth"]
+        registry._data["orphan"]["metadata"]["launch_owner_birth"] = "different process"
+        registry._save()
+        assert not registry.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        registry._load()
+        registry._data["orphan"]["metadata"]["launch_owner_birth"] = correct_birth
+        registry._save()
+        registry._data["orphan"]["started_at"] = time.time() - 121
+        registry._save()
+        assert not registry.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        registry._load()
+        registry._data["orphan"]["started_at"] = time.time()
+        registry._save()
+        owner.kill()
+        owner.wait(timeout=5)
+        restarted = SpawnRegistry(tmp_path / "unused.json")
+        assert not restarted.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        scheduled = asyncio.Event()
+
+        async def background_spawn(**kwargs):
+            assert kwargs["session_id"] == "team-a"
+            assert kwargs["agent_name"] == "Alex [PM]"
+            scheduled.set()
+            return "new-run"
+
+        monkeypatch.setattr(isolated_spawner, "run_isolated_agent_background", background_spawn)
+        assert _team_helpers.wake_team_agent(
+            "team-a", "Alex [PM]", "orphan",
+        ) == "scheduled"
+        await asyncio.wait_for(scheduled.wait(), timeout=2)
+        assert len(bus.read_unread("Alex [PM]")) == 1
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=5)
+
+
 def test_invalid_registry_path_is_not_created_or_used(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

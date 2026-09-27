@@ -201,6 +201,8 @@ async def test_handoff_ids_are_child_only_and_not_persisted(
     )
     record = registry.register.call_args.args[0]
     assert record.original_config["env_vars"] == {"TEAM_SESSION_ID": "team-a"}
+    assert record.metadata["launch_owner_pid"] > 0
+    assert record.metadata["launch_owner_birth"]
     await isolated_spawner._background_tasks[run_id]
     isolated_spawner.run_isolated_agent.assert_awaited_once()
     assert isolated_spawner.run_isolated_agent.call_args.kwargs["env_vars"] == handoff_env

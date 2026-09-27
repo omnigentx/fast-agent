@@ -37,6 +37,24 @@ def _pid_matches_run(pid: int, run_id: str) -> bool:
         return True
     return result.returncode == 0 and f"run_{run_id}.json" in result.stdout
 
+
+def _process_birth(pid: int) -> str | None:
+    """Return a live process's start identity; zombies are not live owners."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],
+            capture_output=True, text=True, timeout=1, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Cannot inspect launch owner PID %s", pid)
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split()
+    if len(parts) < 2 or parts[-1].startswith("Z"):
+        return None
+    return " ".join(parts[:-1])
+
 _TERMINAL_STATES = {"completed", "error", "timeout", "cancelled", "killed"}
 
 
@@ -305,11 +323,28 @@ class SpawnRegistry:
                             if _pid_matches_run(int(pid), d["run_id"]):
                                 return True
                             continue
-                    # Registration precedes OS process creation. A pid-less
-                    # fresh record may still be starting; old ones must not
-                    # prevent recovery forever after a backend crash.
+                    owner = (d.get("metadata") or {}).get("launch_owner_pid")
+                    # The owner only covers the tiny gap before a child PID
+                    # is recorded. Even a live owner cannot reserve it
+                    # indefinitely if the launch task gets stranded.
                     if time.time() - float(d.get("started_at") or 0) >= 120:
                         continue
+                    if owner:
+                        try:
+                            os.kill(int(owner), 0)
+                        except ProcessLookupError:
+                            continue
+                        except PermissionError:
+                            return True
+                        birth = _process_birth(int(owner))
+                        expected_birth = (d.get("metadata") or {}).get(
+                            "launch_owner_birth"
+                        )
+                        if birth is None or (expected_birth and birth != expected_birth):
+                            continue
+                        return True
+                    # Registration precedes OS process creation. A pid-less
+                    # legacy record has no owner identity; bound this grace.
                 return True
         return False
 
