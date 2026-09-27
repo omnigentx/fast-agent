@@ -42,6 +42,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from fast_agent.spawn.config_reader import get_available_servers
+from fast_agent.spawn.context_snapshot_store import load_latest_context_json
 from fast_agent.spawn.isolated_spawner import (
     _check_and_resume_on_inbox,
     cancel_spawn,
@@ -594,6 +595,8 @@ async def restart_spawn(run_id: str) -> str:
         lifecycle=record.lifecycle,
         registry=_registry,
         display_manager=_display,
+        env_vars=env_vars_cfg,
+        skills=cfg.get("skills", []),
         spawn_lifecycle_hooks=_spawn_hooks,
         server_overrides=cfg.get("server_overrides") or None,
         session_id=restart_session_id,
@@ -670,8 +673,8 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
     # crashed agent, name mismatch, DB write failed) — surface that
     # loudly rather than papering it with a stale ``context``/``result``
     # text reconstruction the LLM can't meaningfully continue from.
-    from services.context_persistence import load_latest_context_json
-    snapshot_json = load_latest_context_json(agent_name)
+    session_id = (cfg.get("env_vars") or {}).get("TEAM_SESSION_ID")
+    snapshot_json = load_latest_context_json(agent_name, session_id=session_id)
     if not snapshot_json:
         return json.dumps({
             "error": (
