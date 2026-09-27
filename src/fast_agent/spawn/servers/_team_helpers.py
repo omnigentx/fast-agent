@@ -163,8 +163,9 @@ def get_project_registry() -> "SpawnRegistry | None":
     Single source of truth: the SQLite database at SPAWN_REGISTRY_DB.
     This env var is propagated to all MCP server subprocesses via config_reader.
     """
-    from fast_agent.spawn.spawn_registry import SpawnRegistry
     import sqlite3
+
+    from fast_agent.spawn.spawn_registry import SpawnRegistry
 
     db_path = os.environ.get("SPAWN_REGISTRY_DB", "")
     if db_path:

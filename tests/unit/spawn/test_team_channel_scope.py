@@ -9,13 +9,16 @@ import sqlite3
 import subprocess
 import sys
 import time
-from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
 from fast_agent.spawn.agent_channel import AgentChannel
 from fast_agent.spawn.spawn_registry import SpawnRecord, SpawnRegistry
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _listen_in_child(project_dir: str, session_id: str, run_id: str, pipe) -> None:
