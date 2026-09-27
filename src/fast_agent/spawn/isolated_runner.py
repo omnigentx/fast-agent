@@ -1264,12 +1264,14 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
 
     # RTAC: Real-time Agent Communication — inbox watcher hook
     rtac_before_llm: Any = None
+    rtac_after_llm: Any = None
     try:
         from fast_agent.spawn.inbox_watcher_hook import create_inbox_watcher
 
         watcher = create_inbox_watcher()
         if watcher is not None:
             rtac_before_llm = watcher.before_llm_call
+            rtac_after_llm = watcher.after_llm_call
     except Exception:
         pass  # RTAC is optional — don't break spawn if it fails
 
@@ -1343,6 +1345,8 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
         )
 
         async def merged_after_llm(runner: Any, message: Any) -> None:
+            if rtac_after_llm:
+                await rtac_after_llm(runner, message)
             await spawn_after_llm(runner, message)
             if orig_after_llm:
                 await orig_after_llm(runner, message)
@@ -1373,6 +1377,8 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
         )
 
         async def _chained_after_llm(r: Any, m: Any) -> None:
+            if rtac_after_llm:
+                await rtac_after_llm(r, m)
             await spawn_after_llm(r, m)
             if pause_after_llm_hook:
                 await pause_after_llm_hook(r, m)
