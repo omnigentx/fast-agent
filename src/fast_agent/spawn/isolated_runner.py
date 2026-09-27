@@ -60,6 +60,29 @@ def _ack_initial_inbox_handoff(bus, agent_name: str) -> None:
         bus.mark_done(agent_name, message_id)
 
 
+async def _send_pending_and_ack(
+    agent: Any,
+    pending: str,
+    run_id: str,
+    agent_name: str,
+    trigger: str,
+    bus: Any,
+    message_ids: list[str],
+) -> Any:
+    """Commit inbox delivery only after the agent turn has succeeded.
+
+    A child killed during ``agent.send`` leaves the batch unread, so a
+    subsequent wake can replay it. A crash after send but before the ack may
+    replay a turn; delivery is at least once rather than silently lost.
+    """
+    response = await agent.send(pending)
+    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger)
+    if bus is not None:
+        for message_id in message_ids:
+            bus.mark_done(agent_name, message_id)
+    return response
+
+
 def _install_termination_cleanup(
     run_id: str,
     agent_name: str,
@@ -726,6 +749,7 @@ async def run_child_agent(
                 # subsequent iterations drain the inbox.
                 pending: str | None = task
                 pending_msg_count = 0
+                pending_message_ids: list[str] = []
                 is_first_iter = True
                 last_was_timeout = False
                 response = None
@@ -743,7 +767,15 @@ async def run_child_agent(
                                 )
 
                             try:
-                                response = await agent.send(pending)
+                                response = await _send_pending_and_ack(
+                                    agent,
+                                    pending,
+                                    event_run_id,
+                                    agent_name,
+                                    "task_complete" if is_first_iter else "idle",
+                                    bus,
+                                    pending_message_ids,
+                                )
                             except Exception as _send_exc:
                                 import sys
                                 import traceback
@@ -755,18 +787,12 @@ async def run_child_agent(
                                 sys.stderr.flush()
                                 raise
 
-                            await _save_agent_context_snapshot(
-                                agent,
-                                event_run_id,
-                                agent_name,
-                                "task_complete" if is_first_iter else "idle",
-                            )
-
                             if is_first_iter and is_team_agent:
                                 _ack_initial_inbox_handoff(bus, agent_name)
 
                             pending = None
                             pending_msg_count = 0
+                            pending_message_ids = []
 
                             if is_team_agent:
                                 emit_event("idle", event_run_id, agent_name)
@@ -804,13 +830,13 @@ async def run_child_agent(
                                     f"[{msg.message_type.upper()}] from {msg.from_name}:\n"
                                     f"  {msg.content}\n"
                                 )
-                                bus.mark_done(agent_name, msg.message_id)
                             inbox_lines.append(
                                 "→ Handle these messages: take action and/or reply.\n"
                                 "━━━━━━━━━━━━━━━━━━━━\n"
                             )
                             pending = "\n".join(inbox_lines)
                             pending_msg_count = len(unread)
+                            pending_message_ids = [msg.message_id for msg in unread]
                             continue
 
                         # 4) Empty inbox — sleep waiting for wake signal.
