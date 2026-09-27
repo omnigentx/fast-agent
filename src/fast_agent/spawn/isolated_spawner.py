@@ -204,7 +204,8 @@ async def _run_subprocess(
     ]
 
     subprocess_env = {
-        **os.environ,
+        **{key: value for key, value in os.environ.items()
+           if key != "TEAM_HANDOFF_MESSAGE_IDS"},
         "PYTHONPATH": str(project_path),
     }
     if env_vars:
@@ -756,7 +757,10 @@ async def _resume_on_inbox_claimed(
         raise ValueError("Auto-resume session does not match the spawn record")
 
     # Guard within the owning session; another team may reuse the same name.
-    if registry.has_running_resume(agent_name, resume_session_id):
+    if registry.has_running_resume(
+        agent_name, resume_session_id,
+        verify_process=bool(resume_session_id),
+    ):
         logger.info(
             "📬 %s already has a running instance — skipping auto-resume",
             agent_name,
@@ -1050,6 +1054,11 @@ async def _resume_on_inbox_claimed(
             agent_name, resume_session_id, resume_team_name,
         )
 
+    handoff_env_vars = dict(env_vars or {})
+    handoff_env_vars["TEAM_HANDOFF_MESSAGE_IDS"] = json.dumps(
+        [message.message_id for message in unread]
+    )
+
     new_run_id = await run_isolated_agent_background(
         task=follow_up,
         project_dir=project_dir,
@@ -1065,7 +1074,7 @@ async def _resume_on_inbox_claimed(
         lifecycle="resumable",
         registry=registry,
         display_manager=display_manager,
-        env_vars=env_vars,
+        env_vars=handoff_env_vars,
         skills=cfg.get("skills", []),
         history_file=history_file,
         spawn_lifecycle_hooks=spawn_lifecycle_hooks,
@@ -1073,10 +1082,9 @@ async def _resume_on_inbox_claimed(
         session_id=resume_session_id,
     )
 
-    # A failed launch must leave the inbox retryable. Acknowledge only the
-    # messages included in this handoff, never ones appended during spawn.
-    for message in unread:
-        bus.mark_done(agent_name, message.message_id)
+    # The child acknowledges only after agent.send and snapshot persistence.
+    # Registration/launcher startup can fail asynchronously after this call,
+    # so the parent must leave these inbox messages unread.
 
     # Track the resume chain
     registry._load()
@@ -1152,7 +1160,10 @@ async def run_isolated_agent_background(
                 "agent_name": agent_name or role or "agent",
                 "team_name": team_name,
                 "workspace_dir": workspace_dir or "",
-                "env_vars": env_vars or {},
+                "env_vars": {
+                    key: value for key, value in (env_vars or {}).items()
+                    if key != "TEAM_HANDOFF_MESSAGE_IDS"
+                },
                 "project_dir": str(Path(project_dir).resolve()),
                 # Persist server_overrides so auto-resume / restart_spawn can
                 # restore filesystem (and any other) per-role MCP arg
@@ -1232,15 +1243,18 @@ async def run_isolated_agent_background(
                     error=result.get("error", ""),
                 )
 
-            # ── Auto-resume on inbox messages ──
-            await _check_and_resume_on_inbox(
-                run_id=run_id,
-                agent_name=agent_name,
-                registry=registry,
-                display_manager=display_manager,
-                env_vars=env_vars,
-                spawn_lifecycle_hooks=spawn_lifecycle_hooks,
-            )
+            # Retry durable unread messages on the next explicit wake/startup
+            # reconciliation after a child failure. Immediate auto-resume on
+            # every failed launch would create an unbounded crash loop.
+            if result.get("status") == "completed":
+                await _check_and_resume_on_inbox(
+                    run_id=run_id,
+                    agent_name=agent_name,
+                    registry=registry,
+                    display_manager=display_manager,
+                    env_vars=env_vars,
+                    spawn_lifecycle_hooks=spawn_lifecycle_hooks,
+                )
 
             # ── Emit agent_completed event for PM/bridge notification ──
             if display_manager:

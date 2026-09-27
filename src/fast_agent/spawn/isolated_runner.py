@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 KEEP_ALIVE_TIMEOUT_S = 30.0
 
 
+def _ack_initial_inbox_handoff(bus, agent_name: str) -> None:
+    """Acknowledge only messages whose content was sent successfully to LLM."""
+    raw = os.environ.get("TEAM_HANDOFF_MESSAGE_IDS", "")
+    if not raw or bus is None:
+        return
+    ids = json.loads(raw)
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+        raise ValueError("Invalid TEAM_HANDOFF_MESSAGE_IDS")
+    for message_id in ids:
+        bus.mark_done(agent_name, message_id)
+
+
 def _install_termination_cleanup(
     run_id: str,
     agent_name: str,
@@ -749,6 +761,9 @@ async def run_child_agent(
                                 agent_name,
                                 "task_complete" if is_first_iter else "idle",
                             )
+
+                            if is_first_iter and is_team_agent:
+                                _ack_initial_inbox_handoff(bus, agent_name)
 
                             pending = None
                             pending_msg_count = 0

@@ -164,10 +164,24 @@ def get_project_registry() -> "SpawnRegistry | None":
     This env var is propagated to all MCP server subprocesses via config_reader.
     """
     from fast_agent.spawn.spawn_registry import SpawnRegistry
+    import sqlite3
 
     db_path = os.environ.get("SPAWN_REGISTRY_DB", "")
     if db_path:
         try:
+            path = Path(db_path).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Registry database missing: {path}")
+            # SpawnRegistry's SQLite adapter can create a new empty database;
+            # a misconfigured MCP process must never mistake that for the
+            # team's authoritative spawn registry.
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='spawn_registry'"
+                ).fetchone()
+            if row is None:
+                raise ValueError("spawn_registry table is missing")
             return SpawnRegistry(db_path)
         except Exception as e:
             logger.warning("Failed to open SQLite registry at %s: %s", db_path, e)
@@ -284,21 +298,33 @@ def wake_team_agent(session_id: str, agent_name: str, expected_run_id: str) -> s
             raise RuntimeError("Team agent socket vanished before wake delivery")
         return "signaled"
 
-    # A run may still be launching before its socket binds. Do not launch a
-    # second copy while its registry state is pending/running.
-    running = [rec for rec in records if rec.status in ("pending", "running")]
-    if running:
+    # A run may still be launching before its socket binds. The registry's
+    # running label alone is insufficient after SIGKILL or backend restart.
+    if registry.has_running_resume(
+        agent_name, session_id, verify_process=True,
+    ):
         return "already_running"
+
+    # Ignore stale running/pending labels for the guarded resume below. The
+    # claimed function re-reads the registry and applies the same policy.
 
     loop = asyncio.get_running_loop()
     latest = max(records, key=lambda rec: rec.started_at)
-    loop.create_task(_check_and_resume_on_inbox(
+    task = loop.create_task(_check_and_resume_on_inbox(
         run_id=latest.run_id,
         agent_name=agent_name,
         registry=registry,
         display_manager=None,
         env_vars=(latest.original_config or {}).get("env_vars"),
     ))
+    def _report_task_failure(done: asyncio.Task[None]) -> None:
+        if not done.cancelled() and (error := done.exception()) is not None:
+            logger.error(
+                "[AUTO-WAKE] Scoped resume failed for %s/%s: %s",
+                session_id, agent_name, error, exc_info=error,
+            )
+
+    task.add_done_callback(_report_task_failure)
     return "scheduled"
 
 

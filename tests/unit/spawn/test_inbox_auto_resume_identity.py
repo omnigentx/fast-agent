@@ -148,6 +148,66 @@ async def test_failed_launch_keeps_inbox_message_unread(
 
 
 @pytest.mark.anyio
+async def test_registered_background_run_does_not_ack_before_child_send(
+    fake_registry, mock_message_bus, captured_resume, fake_messages_dir,
+):
+    record = _make_record(messages_dir=fake_messages_dir)
+    fake_registry.get.return_value = record
+    fake_registry._data[record.run_id] = {"restart_count": 0}
+
+    await isolated_spawner._check_and_resume_on_inbox(
+        run_id=record.run_id,
+        agent_name=record.agent_name,
+        registry=fake_registry,
+        env_vars=record.original_config["env_vars"],
+    )
+
+    captured_resume.assert_called_once()
+    assert captured_resume.call_args.kwargs["env_vars"]["TEAM_HANDOFF_MESSAGE_IDS"] == '["m1"]'
+    mock_message_bus.mark_done.assert_not_called()
+    mock_message_bus.mark_all_done.assert_not_called()
+
+
+def test_child_acknowledges_only_handoff_ids_after_success(monkeypatch):
+    from fast_agent.spawn.isolated_runner import _ack_initial_inbox_handoff
+
+    bus = MagicMock()
+    monkeypatch.setenv("TEAM_HANDOFF_MESSAGE_IDS", '["m1", "m2"]')
+    _ack_initial_inbox_handoff(bus, "Phoenix [Dev]")
+    assert bus.mark_done.call_count == 2
+    assert [call.args[1] for call in bus.mark_done.call_args_list] == ["m1", "m2"]
+
+
+@pytest.mark.anyio
+async def test_handoff_ids_are_child_only_and_not_persisted(
+    tmp_path: Path, monkeypatch,
+):
+    registry = MagicMock()
+    monkeypatch.setattr(
+        isolated_spawner, "run_isolated_agent",
+        AsyncMock(return_value={"status": "error", "error": "child startup failed"}),
+    )
+    monkeypatch.setattr(
+        isolated_spawner, "_check_and_resume_on_inbox", AsyncMock(),
+    )
+    handoff_env = {
+        "TEAM_SESSION_ID": "team-a",
+        "TEAM_HANDOFF_MESSAGE_IDS": '["m1"]',
+    }
+    run_id = await isolated_spawner.run_isolated_agent_background(
+        task="Process inbox", project_dir=tmp_path, agent_name="Alex [PM]",
+        role="pm", lifecycle="resumable", registry=registry,
+        env_vars=handoff_env, session_id="team-a",
+    )
+    record = registry.register.call_args.args[0]
+    assert record.original_config["env_vars"] == {"TEAM_SESSION_ID": "team-a"}
+    await isolated_spawner._background_tasks[run_id]
+    isolated_spawner.run_isolated_agent.assert_awaited_once()
+    assert isolated_spawner.run_isolated_agent.call_args.kwargs["env_vars"] == handoff_env
+    isolated_spawner._check_and_resume_on_inbox.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_resume_forwards_team_identity_when_fresh(
     fake_registry, mock_message_bus, captured_resume, fake_messages_dir,
 ):

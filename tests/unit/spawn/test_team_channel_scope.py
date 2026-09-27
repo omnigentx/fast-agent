@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import os
+import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -172,3 +176,122 @@ async def test_failed_launch_releases_claim(
         "original", "Alex [PM]", registry,
     )
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_sigkilled_running_record_is_rescheduled_after_registry_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fast_agent.spawn import isolated_spawner
+    from fast_agent.spawn.servers import _team_helpers
+
+    monkeypatch.setenv("SPAWN_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(tmp_path / "registry.db"))
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        registry = SpawnRegistry(tmp_path / "unused.json")
+        registry.register(SpawnRecord(
+            run_id="dead-run", agent_name="Alex [PM]", role="pm",
+            team_name="team-a", session_id="team-a", status="running",
+            pid=sleeper.pid, started_at=time.time() - 180,
+            original_config={"env_vars": {"TEAM_SESSION_ID": "team-a"}},
+        ))
+        sleeper.kill()
+        sleeper.wait(timeout=5)
+        # A new registry object represents a restarted backend/MCP process.
+        restarted = SpawnRegistry(tmp_path / "unused.json")
+        assert not restarted.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        scheduled = asyncio.Event()
+
+        async def resume(**kwargs):
+            assert kwargs["run_id"] == "dead-run"
+            scheduled.set()
+
+        monkeypatch.setattr(isolated_spawner, "_check_and_resume_on_inbox", resume)
+        assert _team_helpers.wake_team_agent(
+            "team-a", "Alex [PM]", "dead-run",
+        ) == "scheduled"
+        await asyncio.wait_for(scheduled.wait(), timeout=2)
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_resume_failure_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog,
+) -> None:
+    from fast_agent.spawn import isolated_spawner
+    from fast_agent.spawn.servers import _team_helpers
+
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(tmp_path / "registry.db"))
+    registry = SpawnRegistry(tmp_path / "unused.json")
+    registry.register(SpawnRecord(
+        run_id="idle-run", agent_name="Alex [PM]", role="pm",
+        team_name="team-a", session_id="team-a", status="idle",
+    ))
+
+    async def failed_resume(**kwargs):
+        raise RuntimeError("inbox unavailable")
+
+    monkeypatch.setattr(isolated_spawner, "_check_and_resume_on_inbox", failed_resume)
+    assert _team_helpers.wake_team_agent(
+        "team-a", "Alex [PM]", "idle-run",
+    ) == "scheduled"
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert "Scoped resume failed" in caplog.text
+
+
+def test_running_pid_must_belong_to_the_recorded_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(tmp_path / "registry.db"))
+    process = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(60)", "run_live.json",
+    ])
+    try:
+        registry = SpawnRegistry(tmp_path / "unused.json")
+        registry.register(SpawnRecord(
+            run_id="live", agent_name="Alex [PM]", role="pm",
+            team_name="team-a", session_id="team-a", status="running",
+            pid=process.pid, started_at=time.time() - 180,
+        ))
+        assert registry.has_running_resume(
+            "Alex [PM]", "team-a", verify_process=True,
+        )
+        registry.register(SpawnRecord(
+            run_id="wrong", agent_name="Blair [PM]", role="pm",
+            team_name="team-b", session_id="team-b", status="running",
+            pid=process.pid, started_at=time.time() - 180,
+        ))
+        assert not registry.has_running_resume(
+            "Blair [PM]", "team-b", verify_process=True,
+        )
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_invalid_registry_path_is_not_created_or_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fast_agent.spawn.servers._team_helpers import get_project_registry
+
+    missing = tmp_path / "missing.db"
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(missing))
+    assert get_project_registry() is None
+    assert not missing.exists()
+
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(empty))
+    assert get_project_registry() is None
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not a sqlite database")
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(corrupt))
+    assert get_project_registry() is None
