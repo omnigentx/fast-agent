@@ -52,6 +52,7 @@ def _install_termination_cleanup(
     run_id: str,
     agent_name: str,
     channel_sock_path: Path | None,
+    channel_sock_identity: tuple[int, int] | None = None,
 ) -> None:
     """Install atexit + SIGTERM hooks so abnormal exits still:
 
@@ -93,9 +94,10 @@ def _install_termination_cleanup(
         # of this agent name doesn't trip over a stale file.
         if channel_sock_path is not None:
             try:
-                if channel_sock_path.exists():
+                stat = channel_sock_path.stat()
+                if channel_sock_identity == (stat.st_dev, stat.st_ino):
                     channel_sock_path.unlink()
-            except OSError:
+            except (OSError, FileNotFoundError):
                 pass
 
     atexit.register(_cleanup)
@@ -679,7 +681,12 @@ async def run_child_agent(
                                     break
                                 _cur = _cur.parent
 
-                    channel = AgentChannel(agent_name)
+                    team_session_id = os.environ.get("TEAM_SESSION_ID", "")
+                    channel = AgentChannel(
+                        agent_name,
+                        session_id=team_session_id,
+                        run_id=event_run_id if team_session_id else "",
+                    )
                     await channel.start_server()
                     if _msgs_dir:
                         bus = MessageBus(messages_dir=_msgs_dir)
@@ -695,6 +702,7 @@ async def run_child_agent(
                         run_id=event_run_id,
                         agent_name=agent_name,
                         channel_sock_path=channel.socket_path,
+                        channel_sock_identity=channel.socket_identity,
                     )
 
                     logger.info(

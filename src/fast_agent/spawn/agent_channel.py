@@ -16,6 +16,7 @@ Client side (any process):
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import logging
 import os
@@ -64,9 +65,17 @@ def _get_sock_dir(channel_dir: Path | None = None) -> Path:
         # Collision with a real dir/file — remove and recreate
         import shutil
         shutil.rmtree(link, ignore_errors=True)
-        link.symlink_to(real_dir)
+        try:
+            link.symlink_to(real_dir)
+        except FileExistsError:
+            if not link.is_symlink() or link.resolve() != real_dir:
+                raise
     else:
-        link.symlink_to(real_dir)
+        try:
+            link.symlink_to(real_dir)
+        except FileExistsError:
+            if not link.is_symlink() or link.resolve() != real_dir:
+                raise
 
     return link
 
@@ -74,6 +83,18 @@ def _get_sock_dir(channel_dir: Path | None = None) -> Path:
 def _sanitize_name(agent_name: str) -> str:
     """Convert agent name to safe filename (short)."""
     return agent_name.replace(" ", "_").replace("/", "_")
+
+
+def _socket_name(agent_name: str, session_id: str, run_id: str) -> str:
+    """Use a stable, short identity for team runs; retain legacy ad-hoc paths."""
+    if bool(session_id) != bool(run_id):
+        raise ValueError("session_id and run_id must be supplied together")
+    if session_id:
+        digest = hashlib.sha256(
+            f"{session_id}\0{agent_name}\0{run_id}".encode()
+        ).hexdigest()[:16]
+        return f"team_{digest}.sock"
+    return f"{_sanitize_name(agent_name)}.sock"
 
 
 class AgentChannel:
@@ -97,30 +118,66 @@ class AgentChannel:
         AgentChannel.send_signal("Agent A - Dev", "wake")
     """
 
-    def __init__(self, agent_name: str, channel_dir: Path | None = None) -> None:
+    def __init__(
+        self, agent_name: str, channel_dir: Path | None = None, *,
+        session_id: str = "", run_id: str = "",
+    ) -> None:
         self.agent_name = agent_name
         self._channel_dir = _get_sock_dir(channel_dir)
-        self._sock_path = self._channel_dir / f"{_sanitize_name(agent_name)}.sock"
+        self._sock_path = self._channel_dir / _socket_name(agent_name, session_id, run_id)
         self._server: asyncio.AbstractServer | None = None
         self._wake_event = asyncio.Event()
         self._last_signal: str = ""
+        self._socket_identity: tuple[int, int] | None = None
+        self._lock_file = None
 
     @property
     def socket_path(self) -> Path:
         return self._sock_path
 
+    @property
+    def socket_identity(self) -> tuple[int, int] | None:
+        return self._socket_identity
+
+    def _owns_socket(self) -> bool:
+        try:
+            stat = self._sock_path.stat()
+            return self._socket_identity == (stat.st_dev, stat.st_ino)
+        except FileNotFoundError:
+            return False
+
     async def start_server(self) -> None:
         """Start Unix socket server. Call once at agent startup."""
         self._channel_dir.mkdir(parents=True, exist_ok=True)
 
-        # Clean up stale socket
-        if self._sock_path.exists():
-            self._sock_path.unlink()
+        # Python's asyncio Unix server may unlink an existing socket before
+        # bind(). A per-run cross-process lock closes that check/bind race.
+        lock_file = (self._channel_dir / f"{self._sock_path.name}.lock").open("a+")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.close()
+            raise RuntimeError(f"AgentChannel already active: {self._sock_path}") from exc
+        self._lock_file = lock_file
 
-        self._server = await asyncio.start_unix_server(
-            self._handle_client,
-            path=str(self._sock_path),
-        )
+        try:
+            # A live listener from an older runtime may not hold the lock.
+            if self._sock_path.exists():
+                if self._socket_is_live(self._sock_path):
+                    raise RuntimeError(f"AgentChannel already active: {self._sock_path}")
+                self._sock_path.unlink()
+
+            self._server = await asyncio.start_unix_server(
+                self._handle_client,
+                path=str(self._sock_path),
+            )
+            stat = self._sock_path.stat()
+            self._socket_identity = (stat.st_dev, stat.st_ino)
+        except BaseException:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+            self._lock_file = None
+            raise
         logger.info(
             "📡 AgentChannel started for %s at %s",
             self.agent_name,
@@ -180,11 +237,16 @@ class AgentChannel:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        if self._sock_path.exists():
+        if self._owns_socket():
             try:
                 self._sock_path.unlink()
             except OSError:
                 pass
+        self._socket_identity = None
+        if self._lock_file is not None:
+            fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+            self._lock_file.close()
+            self._lock_file = None
         logger.info("📡 AgentChannel stopped for %s", self.agent_name)
 
     # ── Static client API (usable from any process) ──
@@ -194,6 +256,9 @@ class AgentChannel:
         agent_name: str,
         signal: str = "wake",
         channel_dir: Path | None = None,
+        *,
+        session_id: str = "",
+        run_id: str = "",
     ) -> bool:
         """Send a signal to an agent's channel. Non-blocking.
 
@@ -201,7 +266,7 @@ class AgentChannel:
         Safe to call from synchronous code.
         """
         cdir = _get_sock_dir(channel_dir)
-        sock_path = cdir / f"{_sanitize_name(agent_name)}.sock"
+        sock_path = cdir / _socket_name(agent_name, session_id, run_id)
 
         if not sock_path.exists():
             logger.debug(
@@ -236,6 +301,9 @@ class AgentChannel:
     def is_alive(
         agent_name: str,
         channel_dir: Path | None = None,
+        *,
+        session_id: str = "",
+        run_id: str = "",
     ) -> bool:
         """Probe whether an agent's keep-alive listener is actually accepting.
 
@@ -247,7 +315,11 @@ class AgentChannel:
         ``listen()`` accepts it.
         """
         cdir = _get_sock_dir(channel_dir)
-        sock_path = cdir / f"{_sanitize_name(agent_name)}.sock"
+        sock_path = cdir / _socket_name(agent_name, session_id, run_id)
+        return AgentChannel._socket_is_live(sock_path)
+
+    @staticmethod
+    def _socket_is_live(sock_path: Path) -> bool:
         if not sock_path.exists():
             return False
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

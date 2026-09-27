@@ -113,9 +113,10 @@ def captured_resume(monkeypatch):
 
 
 @pytest.fixture
-def fake_registry():
+def fake_registry(tmp_path: Path):
     """Minimal registry stub with .get() / has_running_resume() / mutation."""
     reg = MagicMock()
+    reg._backend = SimpleNamespace(_db_path=str(tmp_path / "registry.db"))
     reg.has_running_resume.return_value = False
     reg._load = MagicMock()
     reg._save = MagicMock()
@@ -124,6 +125,26 @@ def fake_registry():
 
 
 # ── Tests ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_failed_launch_keeps_inbox_message_unread(
+    fake_registry, mock_message_bus, captured_resume, fake_messages_dir,
+):
+    record = _make_record(messages_dir=fake_messages_dir)
+    fake_registry.get.return_value = record
+    captured_resume.side_effect = RuntimeError("spawn failed")
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        await isolated_spawner._check_and_resume_on_inbox(
+            run_id=record.run_id,
+            agent_name=record.agent_name,
+            registry=fake_registry,
+            env_vars=record.original_config["env_vars"],
+        )
+
+    mock_message_bus.mark_done.assert_not_called()
+    mock_message_bus.mark_all_done.assert_not_called()
 
 
 @pytest.mark.anyio

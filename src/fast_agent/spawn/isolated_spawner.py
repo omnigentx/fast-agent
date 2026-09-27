@@ -682,6 +682,57 @@ async def _check_and_resume_on_inbox(
     env_vars: dict[str, str] | None = None,
     spawn_lifecycle_hooks: SpawnLifecycleHooks | None = None,
 ) -> None:
+    """Serialize resume launches per team member across processes.
+
+    The file lock is released by the OS on crash, so an arbitrary time lease
+    cannot expire while a slow launch is still in progress.
+    """
+    import fcntl
+    import hashlib
+
+    record = registry.get(run_id) if registry and run_id else None
+    session_id = (
+        (env_vars or {}).get("TEAM_SESSION_ID", "")
+        or (record.session_id if record else "")
+    )
+    if not session_id:
+        await _resume_on_inbox_claimed(
+            run_id, agent_name, registry, display_manager, env_vars,
+            spawn_lifecycle_hooks,
+        )
+        return
+
+    registry_path = getattr(getattr(registry, "_backend", None), "_db_path", "")
+    if not registry_path:
+        registry_path = getattr(getattr(registry, "_backend", None), "_file", "")
+    if not registry_path:
+        raise RuntimeError("Cannot locate registry for team launch lock")
+    lock_dir = Path(registry_path).parent / "team_launch_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(f"{session_id}\0{agent_name}".encode()).hexdigest()[:24]
+    with (lock_dir / f"{digest}.lock").open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info("[AUTO-RESUME] %s/%s launch already claimed", session_id, agent_name)
+            return
+        try:
+            await _resume_on_inbox_claimed(
+                run_id, agent_name, registry, display_manager, env_vars,
+                spawn_lifecycle_hooks,
+            )
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+async def _resume_on_inbox_claimed(
+    run_id: str,
+    agent_name: str,
+    registry: Any | None = None,
+    display_manager: Any | None = None,
+    env_vars: dict[str, str] | None = None,
+    spawn_lifecycle_hooks: SpawnLifecycleHooks | None = None,
+) -> None:
     """Check inbox for unread messages and auto-resume agent if any.
 
     Called after an agent completes its task. If the agent has unread
@@ -696,8 +747,16 @@ async def _check_and_resume_on_inbox(
         )
         return
 
-    # Guard: skip if agent already has a running instance
-    if registry.has_running_resume(agent_name):
+    record = registry.get(run_id) if run_id else None
+    resume_session_id = (
+        (env_vars or {}).get("TEAM_SESSION_ID", "")
+        or (record.session_id if record else "")
+    )
+    if record and resume_session_id and record.session_id != resume_session_id:
+        raise ValueError("Auto-resume session does not match the spawn record")
+
+    # Guard within the owning session; another team may reuse the same name.
+    if registry.has_running_resume(agent_name, resume_session_id):
         logger.info(
             "📬 %s already has a running instance — skipping auto-resume",
             agent_name,
@@ -853,9 +912,6 @@ async def _check_and_resume_on_inbox(
         "4. When all messages are handled, finish your work"
     )
     follow_up = "\n".join(inbox_lines)
-
-    # Mark all as done (agent will process them in the resumed session)
-    bus.mark_all_done(agent_name)
 
     # Resume the agent
     record = registry.get(run_id)
@@ -1016,6 +1072,11 @@ async def _check_and_resume_on_inbox(
         server_overrides=resume_server_overrides,
         session_id=resume_session_id,
     )
+
+    # A failed launch must leave the inbox retryable. Acknowledge only the
+    # messages included in this handoff, never ones appended during spawn.
+    for message in unread:
+        bus.mark_done(agent_name, message.message_id)
 
     # Track the resume chain
     registry._load()

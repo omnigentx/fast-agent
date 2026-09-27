@@ -256,12 +256,13 @@ class SpawnRegistry:
         data = self._data.get(current_id)
         return SpawnRecord.from_dict(data) if data else None
 
-    def has_running_resume(self, agent_name: str) -> bool:
+    def has_running_resume(self, agent_name: str, session_id: str = "") -> bool:
         """Check if this agent already has a running instance (guard double-resume)."""
         self._load()
         for d in self._data.values():
             if (
                 d.get("agent_name") == agent_name
+                and (not session_id or d.get("session_id") == session_id)
                 and d.get("status") in ("running", "pending")
             ):
                 return True
@@ -293,13 +294,14 @@ class SpawnRegistry:
         self._load()
         return [SpawnRecord.from_dict(d) for d in self._data.values() if d.get("role") == role]
 
-    def find_by_name(self, agent_name: str) -> SpawnRecord | None:
+    def find_by_name(self, agent_name: str, session_id: str = "") -> SpawnRecord | None:
         """Find the latest agent record by agent_name (unique identity)."""
         self._load()
         matches = [
             SpawnRecord.from_dict(d)
             for d in self._data.values()
             if d.get("agent_name") == agent_name
+            and (not session_id or d.get("session_id") == session_id)
         ]
         if not matches:
             return None
