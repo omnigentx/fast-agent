@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import multiprocessing
 import os
 import sqlite3
@@ -225,7 +226,7 @@ async def test_sigkilled_running_record_is_rescheduled_after_registry_reopen(
 
 @pytest.mark.asyncio
 async def test_scheduled_resume_failure_is_logged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from fast_agent.spawn import isolated_spawner
     from fast_agent.spawn.servers import _team_helpers
@@ -241,12 +242,25 @@ async def test_scheduled_resume_failure_is_logged(
         raise RuntimeError("inbox unavailable")
 
     monkeypatch.setattr(isolated_spawner, "_check_and_resume_on_inbox", failed_resume)
-    assert _team_helpers.wake_team_agent(
-        "team-a", "Alex [PM]", "idle-run",
-    ) == "scheduled"
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert "Scoped resume failed" in caplog.text
+    logged = asyncio.Event()
+    records = []
+
+    class _CaptureError(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+            if "Scoped resume failed" in record.getMessage():
+                logged.set()
+
+    handler = _CaptureError()
+    _team_helpers.logger.addHandler(handler)
+    try:
+        assert _team_helpers.wake_team_agent(
+            "team-a", "Alex [PM]", "idle-run",
+        ) == "scheduled"
+        await asyncio.wait_for(logged.wait(), timeout=2)
+    finally:
+        _team_helpers.logger.removeHandler(handler)
+    assert any("inbox unavailable" in r.getMessage() for r in records)
 
 
 def test_running_pid_must_belong_to_the_recorded_run(
