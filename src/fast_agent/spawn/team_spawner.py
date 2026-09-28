@@ -518,21 +518,11 @@ async def spawn_team(
     template = load_team_template(template_name, tdir)
     session_id = str(uuid.uuid4())[:8]
 
-    # Clean up previous session artifacts
-    template_prefix = team_name.lower().replace(" ", "_")[:50]
-    workspaces_base = workspace_root or paths["workspaces"]
-    if Path(workspaces_base).exists():
-        import shutil
-        for old_ws in Path(workspaces_base).iterdir():
-            if old_ws.is_dir() and old_ws.name.startswith(template_prefix):
-                logger.info("Cleaning old workspace: %s", old_ws)
-                shutil.rmtree(old_ws, ignore_errors=True)
-    child_configs = paths["tmp"] / "child_configs"
-    if child_configs.exists():
-        import shutil
-        shutil.rmtree(child_configs, ignore_errors=True)
-
-    project_name = f"{template.get('name', template_name)}_{session_id}"
+    # A second team can spawn while an earlier one is still running. Its
+    # workspace and child config directories belong to that earlier session.
+    # Keep the unique ID at the front so workspace_manager's 50-char cap
+    # cannot truncate it for long template names.
+    project_name = f"{session_id}_{template.get('name', template_name)}"
     workspace = create_workspace(
         project_name,
         workspaces_dir=paths["workspaces"],

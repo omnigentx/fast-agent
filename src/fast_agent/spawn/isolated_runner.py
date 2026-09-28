@@ -48,10 +48,46 @@ logger = logging.getLogger(__name__)
 KEEP_ALIVE_TIMEOUT_S = 30.0
 
 
+def _ack_initial_inbox_handoff(bus, agent_name: str) -> None:
+    """Acknowledge only messages whose content was sent successfully to LLM."""
+    raw = os.environ.get("TEAM_HANDOFF_MESSAGE_IDS", "")
+    if not raw or bus is None:
+        return
+    ids = json.loads(raw)
+    if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+        raise ValueError("Invalid TEAM_HANDOFF_MESSAGE_IDS")
+    for message_id in ids:
+        bus.mark_done(agent_name, message_id)
+
+
+async def _send_pending_and_ack(
+    agent: Any,
+    pending: str,
+    run_id: str,
+    agent_name: str,
+    trigger: str,
+    bus: Any,
+    message_ids: list[str],
+) -> Any:
+    """Commit inbox delivery only after the agent turn has succeeded.
+
+    A child killed during ``agent.send`` leaves the batch unread, so a
+    subsequent wake can replay it. A crash after send but before the ack may
+    replay a turn; delivery is at least once rather than silently lost.
+    """
+    response = await agent.send(pending)
+    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger)
+    if bus is not None:
+        for message_id in message_ids:
+            bus.mark_done(agent_name, message_id)
+    return response
+
+
 def _install_termination_cleanup(
     run_id: str,
     agent_name: str,
     channel_sock_path: Path | None,
+    channel_sock_identity: tuple[int, int] | None = None,
 ) -> None:
     """Install atexit + SIGTERM hooks so abnormal exits still:
 
@@ -93,9 +129,10 @@ def _install_termination_cleanup(
         # of this agent name doesn't trip over a stale file.
         if channel_sock_path is not None:
             try:
-                if channel_sock_path.exists():
+                stat = channel_sock_path.stat()
+                if channel_sock_identity == (stat.st_dev, stat.st_ino):
                     channel_sock_path.unlink()
-            except OSError:
+            except (OSError, FileNotFoundError):
                 pass
 
     atexit.register(_cleanup)
@@ -679,7 +716,12 @@ async def run_child_agent(
                                     break
                                 _cur = _cur.parent
 
-                    channel = AgentChannel(agent_name)
+                    team_session_id = os.environ.get("TEAM_SESSION_ID", "")
+                    channel = AgentChannel(
+                        agent_name,
+                        session_id=team_session_id,
+                        run_id=event_run_id if team_session_id else "",
+                    )
                     await channel.start_server()
                     if _msgs_dir:
                         bus = MessageBus(messages_dir=_msgs_dir)
@@ -695,6 +737,7 @@ async def run_child_agent(
                         run_id=event_run_id,
                         agent_name=agent_name,
                         channel_sock_path=channel.socket_path,
+                        channel_sock_identity=channel.socket_identity,
                     )
 
                     logger.info(
@@ -706,6 +749,7 @@ async def run_child_agent(
                 # subsequent iterations drain the inbox.
                 pending: str | None = task
                 pending_msg_count = 0
+                pending_message_ids: list[str] = []
                 is_first_iter = True
                 last_was_timeout = False
                 response = None
@@ -723,7 +767,15 @@ async def run_child_agent(
                                 )
 
                             try:
-                                response = await agent.send(pending)
+                                response = await _send_pending_and_ack(
+                                    agent,
+                                    pending,
+                                    event_run_id,
+                                    agent_name,
+                                    "task_complete" if is_first_iter else "idle",
+                                    bus,
+                                    pending_message_ids,
+                                )
                             except Exception as _send_exc:
                                 import sys
                                 import traceback
@@ -735,15 +787,12 @@ async def run_child_agent(
                                 sys.stderr.flush()
                                 raise
 
-                            await _save_agent_context_snapshot(
-                                agent,
-                                event_run_id,
-                                agent_name,
-                                "task_complete" if is_first_iter else "idle",
-                            )
+                            if is_first_iter and is_team_agent:
+                                _ack_initial_inbox_handoff(bus, agent_name)
 
                             pending = None
                             pending_msg_count = 0
+                            pending_message_ids = []
 
                             if is_team_agent:
                                 emit_event("idle", event_run_id, agent_name)
@@ -781,13 +830,13 @@ async def run_child_agent(
                                     f"[{msg.message_type.upper()}] from {msg.from_name}:\n"
                                     f"  {msg.content}\n"
                                 )
-                                bus.mark_done(agent_name, msg.message_id)
                             inbox_lines.append(
                                 "→ Handle these messages: take action and/or reply.\n"
                                 "━━━━━━━━━━━━━━━━━━━━\n"
                             )
                             pending = "\n".join(inbox_lines)
                             pending_msg_count = len(unread)
+                            pending_message_ids = [msg.message_id for msg in unread]
                             continue
 
                         # 4) Empty inbox — sleep waiting for wake signal.
@@ -1215,12 +1264,14 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
 
     # RTAC: Real-time Agent Communication — inbox watcher hook
     rtac_before_llm: Any = None
+    rtac_after_llm: Any = None
     try:
         from fast_agent.spawn.inbox_watcher_hook import create_inbox_watcher
 
         watcher = create_inbox_watcher()
         if watcher is not None:
             rtac_before_llm = watcher.before_llm_call
+            rtac_after_llm = watcher.after_llm_call
     except Exception:
         pass  # RTAC is optional — don't break spawn if it fails
 
@@ -1294,6 +1345,8 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
         )
 
         async def merged_after_llm(runner: Any, message: Any) -> None:
+            if rtac_after_llm:
+                await rtac_after_llm(runner, message)
             await spawn_after_llm(runner, message)
             if orig_after_llm:
                 await orig_after_llm(runner, message)
@@ -1324,6 +1377,8 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
         )
 
         async def _chained_after_llm(r: Any, m: Any) -> None:
+            if rtac_after_llm:
+                await rtac_after_llm(r, m)
             await spawn_after_llm(r, m)
             if pause_after_llm_hook:
                 await pause_after_llm_hook(r, m)
@@ -1336,6 +1391,19 @@ def _install_tool_hooks(agent_app: Any, run_id: str, agent_name: str) -> None:
             after_turn_complete=pause_turn_done,
             on_pause_cancel=pause_cancel,
         )
+
+    # Optional host integration. The spawned process has its own agent object,
+    # so only this boundary can attach a host's per-call model hook before the
+    # first LLM request. Plain fast-agent installations have no Jarvis package.
+    from importlib import import_module
+
+    try:
+        host_models = import_module("services.team_model_runtime")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"services", "services.team_model_runtime"}:
+            raise
+    else:
+        host_models.attach_model_hook(agent_app, run_id, agent_name, emit_event)
 
 
 async def _chain_before_llm(spawn_fn: Any, rtac_fn: Any, runner: Any, messages: Any) -> None:

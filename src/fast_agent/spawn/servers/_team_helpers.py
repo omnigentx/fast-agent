@@ -163,11 +163,26 @@ def get_project_registry() -> "SpawnRegistry | None":
     Single source of truth: the SQLite database at SPAWN_REGISTRY_DB.
     This env var is propagated to all MCP server subprocesses via config_reader.
     """
+    import sqlite3
+
     from fast_agent.spawn.spawn_registry import SpawnRegistry
 
     db_path = os.environ.get("SPAWN_REGISTRY_DB", "")
     if db_path:
         try:
+            path = Path(db_path).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Registry database missing: {path}")
+            # SpawnRegistry's SQLite adapter can create a new empty database;
+            # a misconfigured MCP process must never mistake that for the
+            # team's authoritative spawn registry.
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='spawn_registry'"
+                ).fetchone()
+            if row is None:
+                raise ValueError("spawn_registry table is missing")
             return SpawnRegistry(db_path)
         except Exception as e:
             logger.warning("Failed to open SQLite registry at %s: %s", db_path, e)
@@ -212,6 +227,21 @@ def auto_wake_if_idle(agent_name: str) -> None:
     """
     from fast_agent.spawn.agent_channel import AgentChannel
 
+    # MCP servers spawned for team members carry an authoritative session.
+    # Never route their wake through a display name shared by another team.
+    session_id = os.environ.get("TEAM_SESSION_ID", "")
+    if session_id:
+        registry = get_project_registry()
+        record = registry.find_by_name(agent_name, session_id) if registry else None
+        if record is None:
+            logger.error("[AUTO-WAKE] %s absent from session %s", agent_name, session_id)
+            return
+        try:
+            wake_team_agent(session_id, agent_name, record.run_id)
+        except (LookupError, RuntimeError, ValueError):
+            logger.exception("[AUTO-WAKE] Scoped wake failed for %s in %s", agent_name, session_id)
+        return
+
     try:
         alive = AgentChannel.is_alive(agent_name)
     except Exception as e:
@@ -226,6 +256,77 @@ def auto_wake_if_idle(agent_name: str) -> None:
         _wake_alive_agent(agent_name)
     else:
         _respawn_dead_agent(agent_name)
+
+
+def wake_team_agent(session_id: str, agent_name: str, expected_run_id: str) -> str:
+    """Wake exactly one team member, or schedule its session-scoped resume.
+
+    Returns ``signaled``, ``already_running``, or ``scheduled``. Invalid
+    identity, duplicate live runs, and failed delivery raise rather than
+    falling back to another team with the same display name.
+    """
+    import asyncio
+
+    from fast_agent.spawn.agent_channel import AgentChannel
+    from fast_agent.spawn.isolated_spawner import _check_and_resume_on_inbox
+
+    if not session_id or not agent_name or not expected_run_id:
+        raise ValueError("session_id, agent_name, and expected_run_id are required")
+    registry = get_project_registry()
+    if registry is None:
+        raise RuntimeError("Spawn registry is unavailable")
+    expected = registry.get(expected_run_id)
+    if expected is None or expected.session_id != session_id or expected.agent_name != agent_name:
+        raise LookupError("Expected run is not a member of this team session")
+
+    records = [
+        rec for rec in registry.list_all()
+        if rec.session_id == session_id and rec.agent_name == agent_name
+    ]
+    live = [
+        rec for rec in records
+        if AgentChannel.is_alive(
+            agent_name, session_id=session_id, run_id=rec.run_id,
+        )
+    ]
+    if len(live) > 1:
+        raise RuntimeError("Multiple live runs exist for the same team member")
+    if live:
+        target = live[0]
+        if not AgentChannel.send_signal(
+            agent_name, "wake", session_id=session_id, run_id=target.run_id,
+        ):
+            raise RuntimeError("Team agent socket vanished before wake delivery")
+        return "signaled"
+
+    # A run may still be launching before its socket binds. The registry's
+    # running label alone is insufficient after SIGKILL or backend restart.
+    if registry.has_running_resume(
+        agent_name, session_id, verify_process=True,
+    ):
+        return "already_running"
+
+    # Ignore stale running/pending labels for the guarded resume below. The
+    # claimed function re-reads the registry and applies the same policy.
+
+    loop = asyncio.get_running_loop()
+    latest = max(records, key=lambda rec: rec.started_at)
+    task = loop.create_task(_check_and_resume_on_inbox(
+        run_id=latest.run_id,
+        agent_name=agent_name,
+        registry=registry,
+        display_manager=None,
+        env_vars=(latest.original_config or {}).get("env_vars"),
+    ))
+    def _report_task_failure(done: asyncio.Task[None]) -> None:
+        if not done.cancelled() and (error := done.exception()) is not None:
+            logger.error(
+                "[AUTO-WAKE] Scoped resume failed for %s/%s: %s",
+                session_id, agent_name, error, exc_info=error,
+            )
+
+    task.add_done_callback(_report_task_failure)
+    return "scheduled"
 
 
 def _wake_alive_agent(agent_name: str) -> None:
@@ -338,4 +439,3 @@ def _respawn_dead_agent(agent_name: str) -> None:
         "📬 Respawning dead agent %s via spawner (prev run_id=%s)",
         agent_name, record.run_id,
     )
-

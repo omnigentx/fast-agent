@@ -31,7 +31,6 @@ process, not from module-level globals.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -97,8 +96,6 @@ _SERVERS_LIST = ", ".join(get_available_servers(project_dir=str(_PROJECT_DIR)))
 _registry = SpawnRegistry(
     registry_file=str(_PROJECT_DIR / ".runtime" / "state" / "spawn_registry.json"),
 )
-_bus = MessageBus(messages_dir=str(_PROJECT_DIR / ".runtime" / "state" / "messages"))
-
 _display = get_display_manager()
 
 # ── Wire socket-based event forwarding ──
@@ -1169,90 +1166,24 @@ async def spawn_team_tool(
                    Name should reflect the task purpose
                    (e.g. "notes-cli-dev", "payment-redesign").
                    This name is used for display and removal.
-        mode: "blocking" (wait for ALL agents to complete) or
-              "background" (return immediately). Default: background.
-        timeout_seconds: Max seconds to wait in blocking mode (default 300).
-                         If timeout is reached, returns current progress so you
-                         can decide to call get_team_status/get_team_result later,
-                         or call spawn_team_tool again with more time.
+        mode: "background" (return immediately). Legacy "blocking" requests
+              also start in background so progress arrives via push events.
+        timeout_seconds: Deprecated legacy parameter, ignored.
     """
     try:
+        if mode not in {"background", "blocking"}:
+            return json.dumps({"error": "mode must be background or blocking"})
+        requested_blocking = mode == "blocking"
         session = await _spawn_team(
             template_name=template,
             project_brief=project_brief,
             registry=_registry,
             display_manager=_display,
             project_dir=str(_PROJECT_DIR),
-            mode=mode,
+            mode="background",
             team_name=team_name,
             spawn_lifecycle_hooks=_spawn_hooks,
         )
-
-        if mode == "blocking":
-            # Wait for ALL agents (orchestrator + members) to reach terminal state
-            poll_interval = 5
-            elapsed = 0
-            terminal_statuses = {"completed", "error", "cancelled", "failed", "idle"}
-            while elapsed < timeout_seconds:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-
-                # Check all agents in session
-                all_terminal = True
-                for agent_name, info in session.agents.items():
-                    status = info.get("status", "unknown")
-                    # Also check registry for latest status
-                    run_id = info.get("run_id", "")
-                    if run_id:
-                        record = _registry.get_latest(run_id)
-                        if record and record.status in terminal_statuses:
-                            info["status"] = record.status
-                            if record.result:
-                                info["result"] = record.result
-                            continue
-                    if status not in terminal_statuses and status != "available":
-                        all_terminal = False
-
-                if all_terminal:
-                    break
-
-            # Build per-agent info
-            agents_info = {}
-            still_running = []
-            for agent_name, info in session.agents.items():
-                agent_status = info.get("status", "unknown")
-                agents_info[agent_name] = {
-                    "run_id": info.get("run_id", ""),
-                    "role": agent_name,
-                    "status": agent_status,
-                    "result": (info.get("result") or "")[:2000],
-                }
-                if agent_status not in terminal_statuses and agent_status != "available":
-                    still_running.append(agent_name)
-
-            timed_out = elapsed >= timeout_seconds and len(still_running) > 0
-            session.sprint_status = "timeout" if timed_out else "completed"
-
-            result: dict[str, Any] = {
-                "status": session.sprint_status,
-                "session_id": session.session_id,
-                "team_name": team_name,
-                "template": session.template.get("name", template),
-                "workspace": str(session.workspace),
-                "agents": agents_info,
-                "elapsed_seconds": elapsed,
-            }
-
-            if timed_out:
-                result["still_running"] = still_running
-                result["message"] = (
-                    f"Timeout after {elapsed}s. {len(still_running)} agents still running: "
-                    f"{', '.join(still_running)}. "
-                    f"Use get_team_status(session_id='{session.session_id}') to check later, "
-                    f"or get_team_result(session_id='{session.session_id}') for partial results."
-                )
-
-            return json.dumps(result)
 
         # Background mode — return immediately
         agents_info = {
@@ -1279,6 +1210,11 @@ async def spawn_team_tool(
             "agents": agents_info,
             "available_roles": available_roles,
         }
+        if requested_blocking:
+            result["mode_notice"] = (
+                "Blocking wait is no longer used. Team progress and completion "
+                "are delivered as push events; this call returned immediately."
+            )
 
         result["message"] = (
             "Orchestrator spawned. Other roles are available but not yet "
@@ -1650,19 +1586,17 @@ async def send_team_message(
     if not pm_agent_name:
         return json.dumps({"error": "No PM/orchestrator found in this team session."})
 
-    # Team agents read from a session-scoped inbox. The module-level bus is
-    # shared by non-team spawns and would silently queue this directive in a
-    # directory the PM never watches.
+    # Team agents read TEAM_MESSAGES_DIR, which is scoped to this session.
+    # The shared project-level inbox is never observed by their inbox watcher.
     record = _registry.get_latest(pm_run_id) if pm_run_id else None
-    env_vars = (
-        record.original_config.get("env_vars", {})
-        if record and record.original_config else {}
-    )
-    messages_dir = env_vars.get("TEAM_MESSAGES_DIR") or str(
-        _PROJECT_DIR / ".runtime" / "state" / "messages" / session_id
-    )
-    team_bus = MessageBus(messages_dir=messages_dir)
-    msg = team_bus.send(
+    env_vars = (record.original_config or {}).get("env_vars", {}) if record else {}
+    messages_dir = env_vars.get("TEAM_MESSAGES_DIR")
+    if not messages_dir:
+        return json.dumps({
+            "error": "Orchestrator message directory is unavailable; directive was not queued."
+        })
+
+    msg = MessageBus(messages_dir=messages_dir).send(
         from_name="Jarvis",
         to_name=pm_agent_name,
         content=message,
@@ -1680,18 +1614,23 @@ async def send_team_message(
     # the spawn record so the reader can locate the session-scoped
     # ``TEAM_MESSAGES_DIR``.
     woke = False
-    if record and record.status in ("idle", "completed"):
-        try:
-            await _check_and_resume_on_inbox(
-                run_id=pm_run_id,
-                agent_name=pm_agent_name,
-                registry=_registry,
-                display_manager=_display,
-                env_vars=env_vars or None,
-            )
-            woke = True
-        except Exception as e:
-            logger.warning("Failed to auto-wake PM: %s", e)
+    if pm_run_id:
+        if record and record.status in ("idle", "completed"):
+            try:
+                await _check_and_resume_on_inbox(
+                    run_id=pm_run_id,
+                    agent_name=pm_agent_name,
+                    registry=_registry,
+                    display_manager=_display,
+                    env_vars=(
+                        record.original_config.get("env_vars")
+                        if record.original_config
+                        else None
+                    ),
+                )
+                woke = True
+            except Exception as e:
+                logger.warning("Failed to auto-wake PM: %s", e)
 
     return json.dumps({
         "status": "sent",

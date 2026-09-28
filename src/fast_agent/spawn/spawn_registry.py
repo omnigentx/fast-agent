@@ -10,6 +10,8 @@ Three lifecycle models: persistent, resumable, oneshot.
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -19,6 +21,39 @@ from typing import Any, Callable
 from .registry_backends import RegistryBackend, create_backend
 
 logger = logging.getLogger(__name__)
+
+
+def _pid_matches_run(pid: int, run_id: str) -> bool:
+    """Check that a live PID is this run's uv launcher, not a reused PID."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=1, check=False,
+            env={**os.environ, "COLUMNS": "4096"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # If process inspection is unavailable, avoid a duplicate launch.
+        logger.warning("Cannot verify command for live PID %s", pid)
+        return True
+    return result.returncode == 0 and f"run_{run_id}.json" in result.stdout
+
+
+def _process_birth(pid: int) -> str | None:
+    """Return a live process's start identity; zombies are not live owners."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],
+            capture_output=True, text=True, timeout=1, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Cannot inspect launch owner PID %s", pid)
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split()
+    if len(parts) < 2 or parts[-1].startswith("Z"):
+        return None
+    return " ".join(parts[:-1])
 
 _TERMINAL_STATES = {"completed", "error", "timeout", "cancelled", "killed"}
 
@@ -256,14 +291,60 @@ class SpawnRegistry:
         data = self._data.get(current_id)
         return SpawnRecord.from_dict(data) if data else None
 
-    def has_running_resume(self, agent_name: str) -> bool:
-        """Check if this agent already has a running instance (guard double-resume)."""
+    def has_running_resume(
+        self, agent_name: str, session_id: str = "", *,
+        verify_process: bool = False,
+    ) -> bool:
+        """Check running records, optionally verifying actual team-run liveness."""
         self._load()
         for d in self._data.values():
             if (
                 d.get("agent_name") == agent_name
+                and (not session_id or d.get("session_id") == session_id)
                 and d.get("status") in ("running", "pending")
             ):
+                if verify_process and session_id:
+                    from fast_agent.spawn.agent_channel import AgentChannel
+
+                    if AgentChannel.is_alive(
+                        agent_name, session_id=session_id,
+                        run_id=d["run_id"],
+                    ):
+                        return True
+                    pid = d.get("pid")
+                    if pid:
+                        try:
+                            os.kill(int(pid), 0)
+                        except ProcessLookupError:
+                            continue
+                        except PermissionError:
+                            return True
+                        else:
+                            if _pid_matches_run(int(pid), d["run_id"]):
+                                return True
+                            continue
+                    owner = (d.get("metadata") or {}).get("launch_owner_pid")
+                    # The owner only covers the tiny gap before a child PID
+                    # is recorded. Even a live owner cannot reserve it
+                    # indefinitely if the launch task gets stranded.
+                    if time.time() - float(d.get("started_at") or 0) >= 120:
+                        continue
+                    if owner:
+                        try:
+                            os.kill(int(owner), 0)
+                        except ProcessLookupError:
+                            continue
+                        except PermissionError:
+                            return True
+                        birth = _process_birth(int(owner))
+                        expected_birth = (d.get("metadata") or {}).get(
+                            "launch_owner_birth"
+                        )
+                        if birth is None or (expected_birth and birth != expected_birth):
+                            continue
+                        return True
+                    # Registration precedes OS process creation. A pid-less
+                    # legacy record has no owner identity; bound this grace.
                 return True
         return False
 
@@ -293,13 +374,14 @@ class SpawnRegistry:
         self._load()
         return [SpawnRecord.from_dict(d) for d in self._data.values() if d.get("role") == role]
 
-    def find_by_name(self, agent_name: str) -> SpawnRecord | None:
+    def find_by_name(self, agent_name: str, session_id: str = "") -> SpawnRecord | None:
         """Find the latest agent record by agent_name (unique identity)."""
         self._load()
         matches = [
             SpawnRecord.from_dict(d)
             for d in self._data.values()
             if d.get("agent_name") == agent_name
+            and (not session_id or d.get("session_id") == session_id)
         ]
         if not matches:
             return None
