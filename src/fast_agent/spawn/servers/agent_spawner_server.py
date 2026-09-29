@@ -1678,88 +1678,39 @@ async def resume_team_tool(
 ) -> str:
     """Resume a completed/idle team with a follow-up task.
 
-    Restarts the SAME agents from the previous session — same agent
+    Continues the SAME agents from the previous session — same agent
     names, workspace, and full conversation history. Does NOT create
     a new team.
 
-    Each agent is resumed individually via resume_spawn(), which loads
-    their previous conversation history and restores context.
+    Live idle agents receive the follow-up in their existing inbox. Dead
+    idle/terminal agents restart via resume_spawn() with saved history.
+    Reserved roles are not started; active/paused agents are left alone.
+    Results distinguish restarted, queued, skipped, and failed members.
 
     Args:
         session_id: The session_id of the team to resume.
         follow_up_task: New task/brief for the team.
     """
-    session = get_team_session(session_id)
-    if not session:
-        return json.dumps({"error": f"Team session '{session_id}' not found."})
+    from fast_agent.spawn.team_resume import resume_team_members, team_resume_lock
 
-    results: dict[str, Any] = {}
-    resumed_count = 0
-    skipped_count = 0
-
-    for agent_name, info in session.agents.items():
-        original_run_id = info.get("run_id", "")
-        if not original_run_id:
-            results[agent_name] = {"status": "skipped", "reason": "no run_id"}
-            skipped_count += 1
-            continue
-
-        # Follow resume chain to find the latest run_id (DB is source of truth)
-        latest_run_id = _resolve_latest_run_id(original_run_id)
-
-        record = _registry.get(latest_run_id)
-        if not record:
-            results[agent_name] = {"status": "skipped", "reason": f"run_id '{latest_run_id}' not found in registry"}
-            skipped_count += 1
-            continue
-
-        if not record.is_terminal:
-            results[agent_name] = {"status": "skipped", "reason": f"still running (status={record.status})"}
-            skipped_count += 1
-            continue
-
-        # Resume this agent — keeps same name, workspace, loads history
-        try:
-            result_json = await resume_spawn(latest_run_id, follow_up_task)
-            result = json.loads(result_json)
-
-            if result.get("status") == "resumed":
-                new_run_id = result.get("new_run_id", "")
-                # Update session with new run_id so future queries find it
-                session.update_agent_run_id(agent_name, new_run_id)
-                results[agent_name] = {
-                    "status": "resumed",
-                    "new_run_id": new_run_id,
-                }
-                resumed_count += 1
-            else:
-                results[agent_name] = result
-                skipped_count += 1
-        except Exception as e:
-            logger.error("Failed to resume agent %s: %s", agent_name, e, exc_info=True)
-            results[agent_name] = {"status": "error", "reason": str(e)}
-            skipped_count += 1
-
-    session.sprint_status = "running"
-    _get_team_store().upsert(session_id, session.to_dict())
-
-    logger.info(
-        "Team %s resumed: %d agents restarted, %d skipped",
-        session_id, resumed_count, skipped_count,
-    )
-
-    return json.dumps({
-        "status": "resumed",
-        "session_id": session_id,
-        "team_name": session.team_name,
-        "resumed_agents": resumed_count,
-        "skipped_agents": skipped_count,
-        "agents": results,
-        "message": (
-            f"Team '{session.team_name}' resumed with {resumed_count} agents. "
-            f"Use get_team_status(session_id='{session_id}') to monitor."
-        ),
-    })
+    if not follow_up_task.strip():
+        return json.dumps({"error": "follow_up_task must not be empty", "status": "not_resumed"})
+    try:
+        with team_resume_lock(_PROJECT_DIR, session_id):
+            # Load inside the lock; another MCP process may just have updated run IDs.
+            session = get_team_session(session_id)
+            if not session:
+                return json.dumps({"error": f"Team session '{session_id}' not found.",
+                                   "status": "not_resumed"})
+            result = await resume_team_members(
+                session, follow_up_task, _registry, resume_spawn, _PROJECT_DIR,
+            )
+            if result["resumed_agents"] or result["queued_agents"]:
+                _get_team_store().upsert(session_id, session.to_dict())
+            return json.dumps(result)
+    except BlockingIOError:
+        return json.dumps({"status": "busy", "session_id": session_id,
+                           "error": "A resume request for this team is already in progress."})
 
 
 if __name__ == "__main__":
