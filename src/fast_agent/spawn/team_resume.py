@@ -52,7 +52,8 @@ async def resume_team_members(
             if record.lifecycle != "resumable":
                 raise ValueError(f"Lifecycle {record.lifecycle!r} is not resumable")
 
-            if AgentChannel.is_alive(name):
+            channel_identity = {"session_id": session.session_id, "run_id": record.run_id}
+            if AgentChannel.is_alive(name, **channel_identity):
                 cfg = record.original_config or {}
                 env = cfg.get("env_vars") or {}
                 messages_dir = env.get("TEAM_MESSAGES_DIR") or str(
@@ -66,7 +67,7 @@ async def resume_team_members(
                     context={"session_id": session.session_id},
                 )
                 try:
-                    delivered = AgentChannel.send_signal(name, "wake")
+                    delivered = AgentChannel.send_signal(name, "wake", **channel_identity)
                 except Exception:
                     logger.exception("Wake delivery failed for %s", name)
                     delivered = False
