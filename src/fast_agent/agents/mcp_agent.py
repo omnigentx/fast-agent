@@ -516,7 +516,9 @@ class McpAgent(ABC, ToolAgent):
         install reviewed skills outside that workspace can expose read_skill
         without broadening filesystem or shell permissions. Rebuild the
         instruction and refresh any active ToolRunner at a safe boundary after
-        changing this preference. Default behavior remains unchanged.
+        changing this preference. While enabled, adding skill manifests does
+        not implicitly enable shell; existing shell access is preserved.
+        Default behavior remains unchanged.
         """
         if not isinstance(enabled, bool):
             raise TypeError("Skill reader preference must be boolean")
@@ -620,7 +622,7 @@ class McpAgent(ABC, ToolAgent):
             self._skill_reader = None
 
     def _ensure_shell_runtime_for_skills(self) -> None:
-        if self._no_shell_requested:
+        if self._no_shell_requested or self._prefer_skill_reader:
             return
         if self._shell_runtime_enabled:
             return

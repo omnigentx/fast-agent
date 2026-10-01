@@ -39,7 +39,7 @@ def get_available_servers(project_dir: str | Path) -> list[str]:
 # ---------- MCP server env vars ----------
 
 # Servers that need workspace/project env vars
-_TEAM_AWARE_SERVERS = {"meeting_room", "agent_spawner", "email", "model_selection"}
+_TEAM_AWARE_SERVERS = {"meeting_room", "agent_spawner", "email", "model_selection", "plugin_management"}
 
 
 def get_server_env(
