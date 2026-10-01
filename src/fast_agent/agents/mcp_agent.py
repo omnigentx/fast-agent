@@ -202,6 +202,7 @@ class McpAgent(ABC, ToolAgent):
         self._skill_manifests: list[SkillManifest] = []
         self._skill_map: dict[str, SkillManifest] = {}
         self._skill_reader: SkillReader | None = None
+        self._prefer_skill_reader = False
         self._no_shell_requested = bool(context and getattr(context, "no_shell", False))
         self.set_skill_manifests(manifests)
         self.skill_registry: SkillRegistry | None = None
@@ -504,7 +505,24 @@ class McpAgent(ABC, ToolAgent):
     @property
     def skill_read_tool_name(self) -> str:
         """Return the tool name that should be referenced for reading skill content."""
+        if self._prefer_skill_reader:
+            return "read_skill"
         return "read_text_file" if self.has_filesystem_read_text_file_tool else "read_skill"
+
+    def set_skill_reader_preference(self, enabled: bool) -> None:
+        """Prefer the scoped skill reader over an injected filesystem reader.
+
+        Some host filesystem adapters permit only workspace paths. Hosts that
+        install reviewed skills outside that workspace can expose read_skill
+        without broadening filesystem or shell permissions. Rebuild the
+        instruction and refresh any active ToolRunner at a safe boundary after
+        changing this preference. While enabled, adding skill manifests does
+        not implicitly enable shell; existing shell access is preserved.
+        Default behavior remains unchanged.
+        """
+        if not isinstance(enabled, bool):
+            raise TypeError("Skill reader preference must be boolean")
+        self._prefer_skill_reader = enabled
 
     @property
     def initialized(self) -> bool:
@@ -604,7 +622,7 @@ class McpAgent(ABC, ToolAgent):
             self._skill_reader = None
 
     def _ensure_shell_runtime_for_skills(self) -> None:
-        if self._no_shell_requested:
+        if self._no_shell_requested or self._prefer_skill_reader:
             return
         if self._shell_runtime_enabled:
             return

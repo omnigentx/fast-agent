@@ -945,6 +945,19 @@ class ToolRunner:
             stop_reason=LlmStopReason.END_TURN,
         )
 
+    async def refresh_tools(self) -> None:
+        """Refresh live capabilities at a host-controlled safe boundary.
+
+        Hosts may call this from ``before_llm_call`` after attaching/removing
+        capabilities. Discovery failure preserves the previous snapshot.
+        Completed turns and deferred structured finalization cannot be reopened
+        by a capability update.
+        """
+        if self._done or self._deferred_structured_finalization_started:
+            raise RuntimeError("Cannot refresh tools after turn finalization")
+        tools = (await self._agent.list_tools()).tools
+        self._tools = tools
+
     async def _ensure_tools_ready(self) -> None:
         if self._tools is None:
             self._tools = (await self._agent.list_tools()).tools
