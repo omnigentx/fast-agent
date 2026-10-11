@@ -301,6 +301,11 @@ class ShellRuntime:
         shell_path = runtime_details.get("path")
         is_windows = platform.system() == "Windows"
         process_kwargs: dict[str, Any] = {
+            # execute is noninteractive. In a spawned agent fd 0 carries
+            # JSON-RPC control frames; inheriting it lets commands such as cat
+            # steal pings/instructions and keep the idle watchdog alive.
+            # Pipelines and explicit file redirection retain their own stdin.
+            "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "cwd": working_dir,
