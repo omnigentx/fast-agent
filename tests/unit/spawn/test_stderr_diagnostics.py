@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 import time
 from unittest.mock import Mock
@@ -11,6 +12,11 @@ from fast_agent.spawn.spawn_events import SpawnEvent
 
 @pytest.mark.asyncio
 async def test_display_failure_keeps_draining_child_events(monkeypatch, tmp_path, caplog):
+    # Runtime tests configure fast_agent with propagate=False. Capture this
+    # logger directly so the assertion does not depend on suite ordering.
+    monkeypatch.setattr(spawner.logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(spawner.logger, "propagate", False)
+    caplog.set_level(logging.WARNING, logger=spawner.logger.name)
     create = asyncio.create_subprocess_exec
     events = [
         SpawnEvent("thinking", "diag", "QE").to_json_line(),
