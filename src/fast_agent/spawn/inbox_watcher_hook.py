@@ -152,16 +152,20 @@ class InboxWatcherHook:
 def create_inbox_watcher() -> InboxWatcherHook | None:
     """Factory: create InboxWatcherHook from environment variables.
 
-    Returns None if TEAM_MY_NAME or TEAM_WORKSPACE are not set.
+    Prefer the session-scoped directory provided to team writers. The legacy
+    workspace inbox is used only when no explicit directory was configured.
     """
     agent_name = os.environ.get("TEAM_MY_NAME", "")
+    explicit_dir = os.environ.get("TEAM_MESSAGES_DIR", "")
     workspace = os.environ.get("TEAM_WORKSPACE", "")
 
-    if not agent_name or not workspace:
+    if not agent_name or (not explicit_dir and not workspace):
         return None
 
-    messages_dir = Path(workspace) / ".messages"
-    if not messages_dir.exists():
+    messages_dir = Path(explicit_dir) if explicit_dir else Path(workspace) / ".messages"
+    if not messages_dir.is_dir():
+        if explicit_dir:
+            logger.warning("RTAC: configured session inbox is unavailable: %s", messages_dir)
         return None
 
     return InboxWatcherHook(
