@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from fast_agent.spawn.config_reader import get_available_servers
+from fast_agent.spawn.process_tree import SpawnProcessTree
 from fast_agent.spawn.runtime_paths import get_runtime_paths
 from fast_agent.spawn.spawn_events import SpawnEvent
 from fast_agent.spawn.spawn_hooks import (
@@ -41,6 +42,8 @@ DEFAULT_TIMEOUT_SECONDS = 0  # 0 = no timeout (agents run forever, cleaned up on
 # Track background tasks and their subprocesses
 _background_tasks: dict[str, asyncio.Task[None]] = {}
 _background_processes: dict[str, asyncio.subprocess.Process] = {}
+_background_process_trees: dict[str, SpawnProcessTree] = {}
+_EXPLICIT_CANCEL = "explicit_spawn_cancel"
 
 
 def _find_latest_history(workspace_dir: str) -> str | None:
@@ -231,6 +234,7 @@ async def _run_subprocess(
     )
 
     _background_processes[run_id] = process
+    _background_process_trees[run_id] = SpawnProcessTree(process.pid)
 
     # ┌─────────────────────────────────────────────────────────────────┐
     # │ ⚠️  PID gotcha — read before changing pause/resume signal code  │
@@ -371,20 +375,10 @@ async def _run_subprocess(
             duration,
             timeout_seconds,
         )
-        try:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Agent '%s' (run_id=%s) didn't stop after SIGTERM, sending SIGKILL...",
-                    agent_name,
-                    run_id,
-                )
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            pass
+        tree = _background_process_trees.pop(run_id)
+        await asyncio.to_thread(tree.terminate)
+        await process.wait()
+        _background_processes.pop(run_id, None)
 
         return {
             "status": "timeout",
@@ -394,7 +388,15 @@ async def _run_subprocess(
             "metadata": {"duration_seconds": round(duration, 1)},
         }
 
+    finally:
+        # A cancelled reader must not publish late IDLE events after explicit
+        # cancellation, or remain attached to a shutdown-detached worker.
+        if not stderr_task.done():
+            stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+
     _background_processes.pop(run_id, None)
+    _background_process_trees.pop(run_id, None)
 
     duration = time.time() - start_time
 
@@ -1344,14 +1346,14 @@ async def run_isolated_agent_background(
                 except Exception as e:
                     logger.warning("Failed to push team report: %s", e)
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if registry:
                 from fast_agent.spawn.spawn_registry import SpawnStatus
 
-                if lifecycle == "resumable":
-                    # Resumable agents go IDLE on server shutdown — process
-                    # stays alive and can be adopted on next startup.
-                    # Context is preserved via session history files.
+                if lifecycle == "resumable" and cancellation.args != (_EXPLICIT_CANCEL,):
+                    # Server shutdown keeps resumable history available for
+                    # adoption/restart. Explicit user cancellation must remain
+                    # terminal instead of being treated as shutdown detach.
                     registry.update_status(run_id, SpawnStatus.IDLE)
                     logger.info(
                         "Background spawn %s detached (resumable → idle)", run_id,
@@ -1389,24 +1391,25 @@ async def cancel_spawn(
         if record:
             agent_name = getattr(record, "agent_name", "") or ""
 
-    proc = _background_processes.pop(run_id, None)
-    if proc and proc.returncode is None:
-        try:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            cancelled = True
-            logger.info("Subprocess for %s terminated", run_id)
-        except ProcessLookupError:
-            pass
-
+    # Cancel the control task first, with an explicit reason. Otherwise its
+    # resumable-shutdown handler overwrites CANCELLED with IDLE after return.
     task_obj = _background_tasks.pop(run_id, None)
     if task_obj and not task_obj.done():
-        task_obj.cancel()
+        task_obj.cancel(_EXPLICIT_CANCEL)
+        await asyncio.gather(task_obj, return_exceptions=True)
         cancelled = True
+
+    proc = _background_processes.get(run_id)
+    if proc:
+        tree = _background_process_trees.get(run_id)
+        if tree is None and proc.returncode is None:
+            tree = SpawnProcessTree(proc.pid)
+        if tree is not None:
+            await asyncio.to_thread(tree.terminate)
+            cancelled = True
+        await asyncio.wait_for(proc.wait(), timeout=3)
+        _background_processes.pop(run_id, None)
+        _background_process_trees.pop(run_id, None)
 
     if cancelled and registry:
         from fast_agent.spawn.spawn_registry import SpawnStatus
@@ -1432,33 +1435,20 @@ def cleanup_all_spawns() -> None:
 
     killed = 0
     for run_id, proc in list(_background_processes.items()):
-        if proc.returncode is None:  # Still running
-            try:
-                proc.terminate()
+        try:
+            tree = _background_process_trees.get(run_id)
+            if tree is None and proc.returncode is None:
+                tree = SpawnProcessTree(proc.pid)
+            if tree is not None:
+                tree.terminate()
                 killed += 1
-                logger.info("Terminated spawned agent %s (pid=%s)", run_id, proc.pid)
-            except ProcessLookupError:
-                pass
+        except (ProcessLookupError, RuntimeError) as error:
+            logger.error("Spawn cleanup failed for %s: %s", run_id, error, exc_info=True)
 
-    # Cancel asyncio tasks
-    for run_id, task_obj in list(_background_tasks.items()):
+    for task_obj in list(_background_tasks.values()):
         if not task_obj.done():
             task_obj.cancel()
-
-    if killed:
-        # Give processes a moment to exit gracefully
-        import time as _time
-        _time.sleep(1)
-
-        # Force-kill any survivors
-        for run_id, proc in list(_background_processes.items()):
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                    logger.warning("Force-killed spawned agent %s (pid=%s)", run_id, proc.pid)
-                except ProcessLookupError:
-                    pass
-
     _background_processes.clear()
+    _background_process_trees.clear()
     _background_tasks.clear()
-    logger.info("Spawn cleanup complete (%d processes terminated)", killed)
+    logger.info("Spawn cleanup complete (%d process trees terminated)", killed)
