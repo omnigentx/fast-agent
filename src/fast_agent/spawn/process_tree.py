@@ -2,8 +2,35 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
+from typing import Any
 
 import psutil
+
+
+def registered_process_tree(record: Any, run_id: str) -> SpawnProcessTree | None:
+    """Resolve a remote launcher, fenced by birth identity and exact run argv.
+
+    Older records lack birth metadata; their exact runner/config arguments
+    still have to match. Never signal an arbitrary PID from a stale registry.
+    """
+    if record is None or not record.pid:
+        return None
+    try:
+        tree = SpawnProcessTree(record.pid)
+        birth = record.metadata.get('spawn_pid_birth')
+        if birth is not None and birth != tree.root.create_time():
+            return None
+        command = tree.root.cmdline()
+        module_index = command.index('-m')
+        config_index = command.index('--config')
+        if command[module_index + 1] != 'fast_agent.spawn.isolated_runner':
+            return None
+        if Path(command[config_index + 1]).name != f'run_{run_id}.json':
+            return None
+        return tree if tree.root.is_running() else None
+    except (psutil.NoSuchProcess, ValueError, IndexError):
+        return None
 
 
 class SpawnProcessTree:

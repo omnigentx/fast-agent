@@ -114,6 +114,7 @@ class SqliteBackend(RegistryBackend):
     def save(self, data: dict[str, dict[str, Any]]) -> None:
         try:
             with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 # Get existing run_ids
                 existing = {
                     r[0]
@@ -143,7 +144,12 @@ class SqliteBackend(RegistryBackend):
                         ).fetchone()
                         if row:
                             merged = json.loads(row[0])
+                            terminal = {
+                                key: merged.get(key)
+                                for key in ("status", "completed_at", "result", "error")
+                            } if merged.get("status") == "cancelled" else {}
                             merged.update(record)
+                            merged.update(terminal)
                             record = merged
                     conn.execute(
                         "INSERT OR REPLACE INTO spawn_registry (run_id, data_json) VALUES (?, ?)",

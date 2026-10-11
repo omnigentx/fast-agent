@@ -358,6 +358,10 @@ class SpawnRegistry:
         self._load()
         if run_id not in self._data:
             return None
+        if self._data[run_id].get("status") == SpawnStatus.CANCELLED.value:
+            # Resume creates a new run. Late stderr/exit events cannot revive
+            # the cancelled incarnation or replace its terminal outcome.
+            return SpawnRecord.from_dict(self._data[run_id])
         status_val = status.value if isinstance(status, SpawnStatus) else status
         self._data[run_id]["status"] = status_val
         if result:

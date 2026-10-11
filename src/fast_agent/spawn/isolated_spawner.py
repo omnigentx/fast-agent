@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from fast_agent.spawn.config_reader import get_available_servers
-from fast_agent.spawn.process_tree import SpawnProcessTree
+from fast_agent.spawn.process_tree import SpawnProcessTree, registered_process_tree
 from fast_agent.spawn.runtime_paths import get_runtime_paths
 from fast_agent.spawn.spawn_events import SpawnEvent
 from fast_agent.spawn.spawn_hooks import (
@@ -272,6 +272,9 @@ async def _run_subprocess(
         pid_reg._load()
         if run_id in pid_reg._data:
             pid_reg._data[run_id]["pid"] = process.pid
+            pid_reg._data[run_id].setdefault("metadata", {})["spawn_pid_birth"] = (
+                _background_process_trees[run_id].root.create_time()
+            )
             pid_reg._save()
     except Exception:
         pass  # Best-effort PID tracking
@@ -288,52 +291,23 @@ async def _run_subprocess(
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 evt = SpawnEvent.from_line(line)
 
+                if evt and evt.event in ("idle", "resumed"):
+                    # Read on a lifecycle event, not a timer. The durable store
+                    # fences late events from workers cancelled by another MCP.
+                    from fast_agent.spawn.spawn_registry import SpawnRegistry, SpawnStatus
+
+                    try:
+                        reg_path = Path(project_dir).resolve() / ".runtime" / "state" / "spawn_registry.json"
+                        event_registry = SpawnRegistry(registry_file=str(reg_path))
+                        current = event_registry.get(run_id)
+                        if current and current.status == SpawnStatus.CANCELLED.value:
+                            continue
+                        status = SpawnStatus.IDLE if evt.event == "idle" else SpawnStatus.RUNNING
+                        event_registry.update_status(run_id, status)
+                    except Exception:
+                        logger.warning("Failed to persist spawn lifecycle %s", evt.event, exc_info=True)
                 if evt and display_manager:
                     display_manager.handle_event(evt)
-                if evt and evt.event in ("idle", "resumed"):
-                    # Update registry in real-time for keep-alive agents
-                    # so the UI reflects idle/running status immediately
-                    try:
-                        from fast_agent.spawn.spawn_registry import (
-                            SpawnRegistry,
-                            SpawnStatus,
-                        )
-                        reg_path = Path(project_dir).resolve() / ".runtime" / "state" / "spawn_registry.json"
-                        _rt_reg = SpawnRegistry(registry_file=str(reg_path))
-                        _new_status = SpawnStatus.IDLE if evt.event == "idle" else SpawnStatus.RUNNING
-                        _rt_reg.update_status(run_id, _new_status)
-                    except Exception as e:
-                        logger.warning("Failed to update JSON registry on %s: %s", evt.event, e)
-
-                    # Also update SQLite AgentRegistryDB directly — the socket
-                    # pipeline (stderr→display→socket→bridge) can silently fail,
-                    # so this is the authoritative backup for UI status.
-                    try:
-                        db_path = os.environ.get("SPAWN_REGISTRY_DB")
-                        if db_path:
-                            import sqlite3 as _sqlite3
-                            _db_status = "idle" if evt.event == "idle" else "running"
-                            _conn = _sqlite3.connect(db_path, timeout=5)
-                            _row = _conn.execute(
-                                "SELECT data_json FROM spawn_registry WHERE run_id = ?",
-                                (run_id,),
-                            ).fetchone()
-                            if _row:
-                                import json as _json
-                                _rec = _json.loads(_row[0])
-                                _rec["status"] = _db_status
-                                _conn.execute(
-                                    "INSERT OR REPLACE INTO spawn_registry (run_id, data_json) VALUES (?, ?)",
-                                    (run_id, _json.dumps(_rec, ensure_ascii=False)),
-                                )
-                                _conn.commit()
-                                logger.info(
-                                    "Updated AgentRegistryDB: run_id=%s → %s",
-                                    run_id, _db_status,
-                                )
-                            _conn.close()
-                    except Exception as e:
-                        logger.warning("Failed to update AgentRegistryDB on %s: %s", evt.event, e)
                 elif not evt:
                     stderr_lines.append(line)
         except Exception as _crash_exc:
@@ -1254,12 +1228,14 @@ async def run_isolated_agent_background(
                 else:
                     status_enum = SpawnStatus.COMPLETED
 
-                registry.update_status(
+                updated_record = registry.update_status(
                     run_id,
                     status_enum,
                     result=result.get("result", ""),
                     error=result.get("error", ""),
                 )
+                if updated_record and updated_record.status == SpawnStatus.CANCELLED.value:
+                    return  # A remote controller cancelled this run; no wake/report.
 
             # Retry durable unread messages on the next explicit wake/startup
             # reconciliation after a child failure. Immediate auto-resume on
@@ -1384,6 +1360,7 @@ async def cancel_spawn(
     """Cancel a background spawn by run_id."""
     cancelled = False
     agent_name = ""
+    record = None
 
     # Resolve agent_name from registry before cancelling
     if registry:
@@ -1410,6 +1387,12 @@ async def cancel_spawn(
         await asyncio.wait_for(proc.wait(), timeout=3)
         _background_processes.pop(run_id, None)
         _background_process_trees.pop(run_id, None)
+    elif registry:
+        # UI resume is owned by the backend, not this MCP's task dictionary.
+        tree = registered_process_tree(record, run_id)
+        if tree is not None:
+            await asyncio.to_thread(tree.terminate)
+            cancelled = True
 
     if cancelled and registry:
         from fast_agent.spawn.spawn_registry import SpawnStatus
