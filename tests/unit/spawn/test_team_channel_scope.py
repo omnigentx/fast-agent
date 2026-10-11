@@ -351,11 +351,26 @@ async def test_restart_recovers_fresh_running_record_without_child_pid(
         assert not restarted.has_running_resume(
             "Alex [PM]", "team-a", verify_process=True,
         )
+        # A resume needs owned persisted history; missing history is covered
+        # separately by the fail-closed auto-resume regressions.
+        import sqlite3
+        from pathlib import Path
+
+        with sqlite3.connect(tmp_path / "registry.db") as connection:
+            connection.execute(
+                "CREATE TABLE agent_context_snapshots(id INTEGER, agent_name TEXT, "
+                "session_id TEXT, context_json TEXT, created_at REAL)"
+            )
+            connection.execute(
+                "INSERT INTO agent_context_snapshots VALUES(1, 'Alex [PM]', 'team-a', ?, 1)",
+                ('{"messages":[{"role":"user","content":[{"type":"text","text":"original task"}]}]}',),
+            )
         scheduled = asyncio.Event()
 
         async def background_spawn(**kwargs):
             assert kwargs["session_id"] == "team-a"
             assert kwargs["agent_name"] == "Alex [PM]"
+            Path(kwargs["history_file"]).unlink()
             scheduled.set()
             return "new-run"
 

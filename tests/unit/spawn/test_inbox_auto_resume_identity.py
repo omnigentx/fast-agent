@@ -532,3 +532,96 @@ async def test_register_persists_server_overrides_in_original_config(
     assert cfg.get("workspace_dir") == "/tmp/ws", (
         "workspace_dir MUST be in original_config so resume preserves it"
     )
+
+
+@pytest.mark.anyio
+async def test_database_resume_preserves_compacted_history(
+    fake_registry,
+    mock_message_bus,
+    captured_resume,
+    fake_messages_dir,
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import sqlite3
+    from pathlib import Path
+
+    record = _make_record(messages_dir=fake_messages_dir)
+    fake_registry.get.return_value = record
+    db_path = tmp_path / "snapshots.db"
+    history = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[COMPACTED_CONTEXT_SUMMARY] verified workflow"}
+                ],
+            }
+        ]
+    }
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "CREATE TABLE agent_context_snapshots (id INTEGER, agent_name TEXT, session_id TEXT, context_json TEXT, created_at REAL)"
+        )
+        db.execute(
+            "INSERT INTO agent_context_snapshots VALUES (1, ?, ?, ?, 1)",
+            (record.agent_name, record.session_id, json.dumps(history)),
+        )
+        db.execute(
+            "INSERT INTO agent_context_snapshots VALUES (2, ?, ?, ?, 2)",
+            (record.agent_name, "other-team", json.dumps([{"role": "user", "content": "foreign"}])),
+        )
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
+    await isolated_spawner._check_and_resume_on_inbox(
+        run_id=record.run_id,
+        agent_name=record.agent_name,
+        registry=fake_registry,
+        env_vars=record.original_config["env_vars"],
+    )
+    kwargs = captured_resume.call_args.kwargs
+    assert kwargs["history_file"]
+    path = Path(kwargs["history_file"])
+    try:
+        assert json.loads(path.read_text()) == history
+        assert "Your Previous Work Summary" not in kwargs["context"]
+    finally:
+        path.unlink(missing_ok=True)
+    mock_message_bus.mark_done.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("snapshot", [None, "invalid json"])
+async def test_database_resume_fails_closed_without_valid_history(
+    fake_registry,
+    mock_message_bus,
+    captured_resume,
+    fake_messages_dir,
+    tmp_path,
+    monkeypatch,
+    snapshot,
+):
+    import sqlite3
+
+    record = _make_record(messages_dir=fake_messages_dir)
+    fake_registry.get.return_value = record
+    db_path = tmp_path / "snapshots.db"
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "CREATE TABLE agent_context_snapshots (id INTEGER, agent_name TEXT, session_id TEXT, context_json TEXT, created_at REAL)"
+        )
+        if snapshot:
+            db.execute(
+                "INSERT INTO agent_context_snapshots VALUES (1, ?, ?, ?, 1)",
+                (record.agent_name, record.session_id, snapshot),
+            )
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
+    await isolated_spawner._check_and_resume_on_inbox(
+        run_id=record.run_id,
+        agent_name=record.agent_name,
+        registry=fake_registry,
+        env_vars=record.original_config["env_vars"],
+    )
+    captured_resume.assert_not_called()
+    mock_message_bus.mark_done.assert_not_called()
+    mock_message_bus.mark_all_done.assert_not_called()

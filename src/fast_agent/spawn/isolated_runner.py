@@ -656,7 +656,11 @@ async def run_child_agent(
                 try:
                     from services.context_compaction import attach_compaction_hooks_to_all
 
-                    if attach_compaction_hooks_to_all(agent):
+                    if attach_compaction_hooks_to_all(
+                        agent, run_id=event_run_id,
+                        session_id=os.environ.get("TEAM_SESSION_ID"),
+                        team_name=config.get("team_name"),
+                    ):
                         logger.info(
                             "[COMPACT] compaction hook attached to spawned agent %s", agent_name
                         )
@@ -695,22 +699,11 @@ async def run_child_agent(
                 # If resuming, load previous session history into agent
                 # This uses FastAgent's native API — no LLM call, just
                 # restores message_history so the next send() has full context
-                if history_file and Path(history_file).exists():
-                    from fast_agent.mcp.prompts.prompt_load import (
-                        load_history_into_agent,
-                    )
+                if history_file:
+                    from fast_agent.spawn.resume_history import restore_history
 
-                    try:
-                        load_history_into_agent(agent[agent_name], Path(history_file))
-                        logger.info(
-                            "📂 Loaded previous history from %s",
-                            history_file,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "⚠️ Failed to load history: %s — continuing fresh",
-                            exc,
-                        )
+                    restore_history(agent[agent_name], Path(history_file))
+                    logger.info("Loaded previous history from %s", history_file)
 
                 # ── Unified inbox-driven lifetime loop ──
                 # The agent's lifetime is a single loop over a persistent

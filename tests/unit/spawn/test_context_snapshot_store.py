@@ -91,3 +91,28 @@ async def test_resume_spawn_reads_history_without_jarvis_import(monkeypatch, tmp
     history_file = Path(observed["history_file"])
     assert json.loads(history_file.read_text(encoding="utf-8")) == [{"role": "user"}]
     history_file.unlink()
+
+
+def test_newest_owned_working_snapshot_then_newer_raw(monkeypatch, tmp_path):
+    db_path = tmp_path / "history.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE agent_context_snapshots(id INTEGER, agent_name TEXT, session_id TEXT, context_json TEXT, created_at REAL)"
+        )
+        connection.execute(
+            "CREATE TABLE context_compaction_events(id INTEGER, agent_name TEXT, session_id TEXT, working_context_json TEXT, status TEXT, created_at REAL)"
+        )
+        connection.execute("INSERT INTO agent_context_snapshots VALUES(1, 'QE', 'a', 'raw', 1)")
+        connection.executemany(
+            "INSERT INTO context_compaction_events VALUES(?, 'QE', ?, ?, ?, ?)",
+            [
+                (1, "a", "compact", "completed", 2),
+                (2, "other", "foreign", "completed", 5),
+                (3, "a", "failed", "failed", 6),
+            ],
+        )
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
+    assert load_latest_context_json("QE", session_id="a") == "compact"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("INSERT INTO agent_context_snapshots VALUES(2, 'QE', 'a', 'new raw', 3)")
+    assert load_latest_context_json("QE", session_id="a") == "new raw"

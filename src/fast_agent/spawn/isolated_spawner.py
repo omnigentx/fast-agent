@@ -906,36 +906,54 @@ async def _resume_on_inbox_claimed(
     cfg = record.original_config
     prev_result = record.result or ""
 
-    # Find previous session history for native FastAgent resume
+    # Jarvis snapshots are authoritative; workspace files may predate compaction.
     workspace_dir = cfg.get("workspace_dir", "")
-    history_file = _find_latest_history(workspace_dir) if workspace_dir else None
+    database_path = (env_vars or {}).get("SPAWN_REGISTRY_DB") or os.environ.get(
+        "SPAWN_REGISTRY_DB"
+    )
+    history_file = None
+    if database_path:
+        from fast_agent.spawn.context_snapshot_store import materialize_resume_history
 
-    if history_file:
-        # History file found — agent will get full conversation via
-        # load_history_into_agent(). Resume task is just the new messages.
+        snapshot_session_id = (cfg.get("env_vars") or {}).get("TEAM_SESSION_ID") or record.session_id
+        try:
+            history_file = materialize_resume_history(
+                agent_name, session_id=snapshot_session_id, db_path=database_path
+            )
+        except (ValueError, OSError):
+            logger.exception("[AUTO-RESUME] %s: history restoration blocked; inbox retained", agent_name)
+            return
         enriched_context = follow_up
-        logger.info(
-            "📂 Found previous history for %s: %s",
-            agent_name,
-            history_file,
-        )
     else:
-        # No history file — fall back to text-based context
-        enriched_parts: list[str] = []
-        original_task = cfg.get("task", "")
-        if original_task:
-            enriched_parts.append(f"## Your Original Task\n{original_task}")
-        original_context = cfg.get("context", "")
-        if original_context:
-            enriched_parts.append(f"## Project Context\n{original_context}")
-        if prev_result:
-            enriched_parts.append(f"## Your Previous Work Summary\n{prev_result}")
-        enriched_parts.append(follow_up)
-        enriched_context = "\n\n".join(enriched_parts)
-        logger.info(
-            "⚠️ No history file for %s — using text-based context",
-            agent_name,
-        )
+        history_file = _find_latest_history(workspace_dir) if workspace_dir else None
+
+        if history_file:
+            # History file found — agent will get full conversation via
+            # load_history_into_agent(). Resume task is just the new messages.
+            enriched_context = follow_up
+            logger.info(
+                "📂 Found previous history for %s: %s",
+                agent_name,
+                history_file,
+            )
+        else:
+            # No history file — fall back to text-based context
+            enriched_parts: list[str] = []
+            original_task = cfg.get("task", "")
+            if original_task:
+                enriched_parts.append(f"## Your Original Task\n{original_task}")
+            original_context = cfg.get("context", "")
+            if original_context:
+                enriched_parts.append(f"## Project Context\n{original_context}")
+            if prev_result:
+                enriched_parts.append(f"## Your Previous Work Summary\n{prev_result}")
+            enriched_parts.append(follow_up)
+            enriched_context = "\n\n".join(enriched_parts)
+            logger.info(
+                "⚠️ No history file for %s — using text-based context",
+                agent_name,
+            )
+
 
     # Determine correct project_dir from original_config (fixes Unknown MCP servers)
     project_dir = cfg.get("project_dir", "")
