@@ -122,11 +122,9 @@ def _dbg(msg: str) -> None:
             _dbg_file = open(log_dir / "event_socket_debug.log", "a", buffering=1)  # line-buffered
 
         import time as _t
-
         _dbg_file.write(f"{_t.strftime('%H:%M:%S')} {msg}\n")
     except Exception as e:
         import sys
-
         sys.stderr.write(f"[_dbg WARN] Cannot write debug: {e}\n")
 
 
@@ -206,15 +204,13 @@ def _emit_team_event(event_type: str, session_id: str, team_name: str, data: dic
     try:
         import time as _time
 
-        line = json.dumps(
-            {
-                "timestamp": _time.time(),
-                "agent_name": "system",
-                "event_type": event_type,
-                "run_id": "",
-                "data": {"session_id": session_id, "team_name": team_name, **data},
-            }
-        )
+        line = json.dumps({
+            "timestamp": _time.time(),
+            "agent_name": "system",
+            "event_type": event_type,
+            "run_id": "",
+            "data": {"session_id": session_id, "team_name": team_name, **data},
+        })
         _send_event_line(line)
     except Exception as e:
         _dbg(f"TEAM EVENT FAILED: {event_type} → {e}")
@@ -225,18 +221,16 @@ def _emit_removal_event(agent_names: list[str], run_ids: list[str]) -> None:
     try:
         import time as _time
 
-        line = json.dumps(
-            {
-                "timestamp": _time.time(),
-                "role": "system",
-                "event_type": "removed",
-                "run_id": "",
-                "data": {
-                    "agent_names": agent_names,
-                    "run_ids": run_ids,
-                },
-            }
-        )
+        line = json.dumps({
+            "timestamp": _time.time(),
+            "role": "system",
+            "event_type": "removed",
+            "run_id": "",
+            "data": {
+                "agent_names": agent_names,
+                "run_ids": run_ids,
+            },
+        })
         _send_event_line(line)
     except Exception as e:
         _dbg(f"REMOVAL EVENT FAILED: {e}")
@@ -246,21 +240,17 @@ def _emit_removal_event(agent_names: list[str], run_ids: list[str]) -> None:
 class _SocketSpawnLifecycleHooks:
     """SpawnLifecycleHooks that sends lifecycle events via socket for bridge consumption."""
 
-    def _emit(
-        self, event_type: str, run_id: str, agent_name: str, data: dict | None = None
-    ) -> None:
+    def _emit(self, event_type: str, run_id: str, agent_name: str, data: dict | None = None) -> None:
         try:
             import time as _time
 
-            line = json.dumps(
-                {
-                    "timestamp": _time.time(),
-                    "agent_name": agent_name or "system",
-                    "event_type": event_type,
-                    "run_id": run_id,
-                    "data": data or {},
-                }
-            )
+            line = json.dumps({
+                "timestamp": _time.time(),
+                "agent_name": agent_name or "system",
+                "event_type": event_type,
+                "run_id": run_id,
+                "data": data or {},
+            })
             _send_event_line(line)
         except Exception as e:
             _dbg(f"LIFECYCLE EMIT FAILED: {event_type} → {e}")
@@ -269,16 +259,11 @@ class _SocketSpawnLifecycleHooks:
         self._emit("lifecycle_pre_spawn", run_id, agent_name, {"config_keys": list(config.keys())})
 
     async def on_registered(self, run_id: str, agent_name: str, record: Any) -> None:
-        self._emit(
-            "lifecycle_registered",
-            run_id,
-            agent_name,
-            {
-                "lifecycle": getattr(record, "lifecycle", ""),
-                "role": getattr(record, "role", ""),
-                "team_name": getattr(record, "team_name", ""),
-            },
-        )
+        self._emit("lifecycle_registered", run_id, agent_name, {
+            "lifecycle": getattr(record, "lifecycle", ""),
+            "role": getattr(record, "role", ""),
+            "team_name": getattr(record, "team_name", ""),
+        })
 
     async def on_process_started(self, run_id: str, agent_name: str, pid: int) -> None:
         self._emit("lifecycle_process_started", run_id, agent_name, {"pid": pid})
@@ -306,15 +291,8 @@ class _SocketSpawnLifecycleHooks:
     async def on_after_cleanup(self, run_id: str, agent_name: str, lifecycle: str) -> None:
         self._emit("lifecycle_after_cleanup", run_id, agent_name, {"lifecycle": lifecycle})
 
-    async def on_auto_resume(
-        self, run_id: str, agent_name: str, new_run_id: str, reason: str
-    ) -> None:
-        self._emit(
-            "lifecycle_auto_resume",
-            run_id,
-            agent_name,
-            {"new_run_id": new_run_id, "reason": reason},
-        )
+    async def on_auto_resume(self, run_id: str, agent_name: str, new_run_id: str, reason: str) -> None:
+        self._emit("lifecycle_auto_resume", run_id, agent_name, {"new_run_id": new_run_id, "reason": reason})
 
     async def on_cancelled(self, run_id: str, agent_name: str) -> None:
         self._emit("lifecycle_cancelled", run_id, agent_name)
@@ -596,7 +574,10 @@ async def restart_spawn(run_id: str) -> str:
     # AND filesystem/etc. MCPs start with the right per-role args. Same SSoT
     # reasoning documented at isolated_spawner.py _check_and_resume_on_inbox.
     env_vars_cfg = cfg.get("env_vars") or {}
-    restart_session_id = env_vars_cfg.get("TEAM_SESSION_ID", "") or record.session_id
+    restart_session_id = (
+        env_vars_cfg.get("TEAM_SESSION_ID", "")
+        or record.session_id
+    )
     new_run_id = await run_isolated_agent_background(
         task=cfg.get("task", record.task),
         project_dir=str(_PROJECT_DIR),
@@ -877,13 +858,17 @@ def _open_dynamic_agents_db(db_path: str):  # -> sqlite3.Connection
         )
         """
     )
-    conn.execute("INSERT OR IGNORE INTO agent_definitions_meta (key, value) VALUES ('rev', '0')")
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_definitions_meta (key, value) VALUES ('rev', '0')"
+    )
     return conn
 
 
 def _bump_rev_in_conn(conn) -> int:
     """Increment the rev counter on an open connection. Caller commits."""
-    row = conn.execute("SELECT value FROM agent_definitions_meta WHERE key = 'rev'").fetchone()
+    row = conn.execute(
+        "SELECT value FROM agent_definitions_meta WHERE key = 'rev'"
+    ).fetchone()
     new_rev = int(row[0] if row else 0) + 1
     conn.execute(
         "INSERT OR REPLACE INTO agent_definitions_meta (key, value) VALUES ('rev', ?)",
@@ -1074,12 +1059,16 @@ def remove_spawned_agent(name: str) -> str:
     template_removed = False
     if db_path:
         try:
-            template_removed = _delete_dynamic_agent_from_db(db_path=db_path, name=name)
+            template_removed = _delete_dynamic_agent_from_db(
+                db_path=db_path, name=name
+            )
         except Exception as exc:  # noqa: BLE001
             # Don't abort registry cleanup on a DB failure; surface in
             # the message so the caller can act.
             template_removed = False
-            logger.warning("Failed to delete agent_definitions row for '%s': %s", name, exc)
+            logger.warning(
+                "Failed to delete agent_definitions row for '%s': %s", name, exc
+            )
 
     # Try individual agent removal from registry
     registry_removed = False
@@ -1120,13 +1109,14 @@ def remove_spawned_agent(name: str) -> str:
         if db_path:
             for member in team_members:
                 try:
-                    if _delete_dynamic_agent_from_db(db_path=db_path, name=member.agent_name):
+                    if _delete_dynamic_agent_from_db(
+                        db_path=db_path, name=member.agent_name
+                    ):
                         defs_removed += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to delete agent_definitions row for team member '%s': %s",
-                        member.agent_name,
-                        exc,
+                        member.agent_name, exc,
                     )
 
         # Remove all registry entries for the team
@@ -1141,7 +1131,9 @@ def remove_spawned_agent(name: str) -> str:
         return json.dumps(
             {
                 "status": "success",
-                "message": (f"Team '{name}' fully cleaned up: {', '.join(cleaned_parts)}."),
+                "message": (
+                    f"Team '{name}' fully cleaned up: {', '.join(cleaned_parts)}."
+                ),
                 "removed_agents": team_agent_names,
                 "cleaned": cleaned_parts,
             }
@@ -1227,7 +1219,8 @@ async def spawn_team_tool(
 
         # Collect available (not yet spawned) roles
         available_roles = [
-            role for role, info in session.agents.items() if info.get("status") == "available"
+            role for role, info in session.agents.items()
+            if info.get("status") == "available"
         ]
 
         result: dict[str, Any] = {
@@ -1252,16 +1245,11 @@ async def spawn_team_tool(
             f"session_id='{session.session_id}'"
         )
 
-        _emit_team_event(
-            "team_spawned",
-            session.session_id,
-            team_name,
-            {
-                "template": session.template.get("name", template),
-                "workspace": str(session.workspace),
-                "available_roles": available_roles,
-            },
-        )
+        _emit_team_event("team_spawned", session.session_id, team_name, {
+            "template": session.template.get("name", template),
+            "workspace": str(session.workspace),
+            "available_roles": available_roles,
+        })
 
         return json.dumps(result)
     except ValueError as e:
@@ -1315,28 +1303,21 @@ async def spawn_team_members(
         team_name = session.team_name if session else team_session_id
         for role_name, info in results.items():
             if "run_id" in info:
-                _emit_team_event(
-                    "team_member_spawned",
-                    team_session_id,
-                    team_name,
-                    {
-                        "role": role_name,
-                        "agent_name": info.get("agent_name", ""),
-                        "run_id": info["run_id"],
-                    },
-                )
+                _emit_team_event("team_member_spawned", team_session_id, team_name, {
+                    "role": role_name,
+                    "agent_name": info.get("agent_name", ""),
+                    "run_id": info["run_id"],
+                })
 
-        return json.dumps(
-            {
-                "status": "spawned",
-                "session_id": team_session_id,
-                "spawned": results,
-                "message": (
-                    f"Spawned {len(results)} team members. "
-                    "Results will be auto-delivered to your inbox when members complete."
-                ),
-            }
-        )
+        return json.dumps({
+            "status": "spawned",
+            "session_id": team_session_id,
+            "spawned": results,
+            "message": (
+                f"Spawned {len(results)} team members. "
+                "Results will be auto-delivered to your inbox when members complete."
+            ),
+        })
     except ValueError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
@@ -1357,22 +1338,21 @@ def get_team_status(session_id: str = "") -> str:
     if not session_id:
         sessions = list_team_sessions()
         sessions.sort(key=lambda s: s.get("session_id", ""), reverse=True)
-        return json.dumps(
-            {
-                "count": len(sessions),
-                "sessions": [
-                    {
-                        "session_id": s.get("session_id"),
-                        "team_name": s.get("team_name"),
-                        "sprint_status": s.get("sprint_status"),
-                        "agents": {
-                            name: info.get("status") for name, info in s.get("agents", {}).items()
-                        },
-                    }
-                    for s in sessions
-                ],
-            }
-        )
+        return json.dumps({
+            "count": len(sessions),
+            "sessions": [
+                {
+                    "session_id": s.get("session_id"),
+                    "team_name": s.get("team_name"),
+                    "sprint_status": s.get("sprint_status"),
+                    "agents": {
+                        name: info.get("status")
+                        for name, info in s.get("agents", {}).items()
+                    },
+                }
+                for s in sessions
+            ],
+        })
 
     # --- Single session mode ---
     session = get_team_session(session_id)
@@ -1445,13 +1425,18 @@ def get_team_status(session_id: str = "") -> str:
         agents[name] = entry
 
     # Separate spawned vs available (not yet spawned)
-    spawned = {k: v for k, v in session.agents.items() if v.get("status") != "available"}
-    available = {k: v for k, v in session.agents.items() if v.get("status") == "available"}
+    spawned = {k: v for k, v in session.agents.items()
+               if v.get("status") != "available"}
+    available = {k: v for k, v in session.agents.items()
+                 if v.get("status") == "available"}
 
     total_spawned = len(spawned)
-    done = sum(1 for a in spawned.values() if a.get("status") in _terminal_done)
-    errored = sum(1 for a in spawned.values() if a.get("status") == "error")
-    stuck = sum(1 for a in spawned.values() if a.get("status") == "stuck")
+    done = sum(1 for a in spawned.values()
+               if a.get("status") in _terminal_done)
+    errored = sum(1 for a in spawned.values()
+                  if a.get("status") == "error")
+    stuck = sum(1 for a in spawned.values()
+                if a.get("status") == "stuck")
 
     # Sprint-level status. "completed" is reserved for the case where
     # every spawned agent reached a terminal state without anyone
@@ -1628,9 +1613,9 @@ async def send_team_message(
     env_vars = (record.original_config or {}).get("env_vars", {}) if record else {}
     messages_dir = env_vars.get("TEAM_MESSAGES_DIR")
     if not messages_dir:
-        return json.dumps(
-            {"error": "Orchestrator message directory is unavailable; directive was not queued."}
-        )
+        return json.dumps({
+            "error": "Orchestrator message directory is unavailable; directive was not queued."
+        })
 
     msg = MessageBus(messages_dir=messages_dir).send(
         from_name="Jarvis",
@@ -1659,26 +1644,26 @@ async def send_team_message(
                     registry=_registry,
                     display_manager=_display,
                     env_vars=(
-                        record.original_config.get("env_vars") if record.original_config else None
+                        record.original_config.get("env_vars")
+                        if record.original_config
+                        else None
                     ),
                 )
                 woke = True
             except Exception as e:
                 logger.warning("Failed to auto-wake PM: %s", e)
 
-    return json.dumps(
-        {
-            "status": "sent",
-            "message_id": msg.message_id,
-            "to": pm_agent_name,
-            "priority": priority,
-            "auto_woke_pm": woke,
-            "message": (
-                f"Directive sent to {pm_agent_name}."
-                + (" PM was idle and has been woken." if woke else "")
-            ),
-        }
-    )
+    return json.dumps({
+        "status": "sent",
+        "message_id": msg.message_id,
+        "to": pm_agent_name,
+        "priority": priority,
+        "auto_woke_pm": woke,
+        "message": (
+            f"Directive sent to {pm_agent_name}."
+            + (" PM was idle and has been woken." if woke else "")
+        ),
+    })
 
 
 # ───────────────────────────────────────────────────────────
@@ -1736,27 +1721,17 @@ async def resume_team_tool(
             # Load inside the lock; another MCP process may just have updated run IDs.
             session = get_team_session(session_id)
             if not session:
-                return json.dumps(
-                    {"error": f"Team session '{session_id}' not found.", "status": "not_resumed"}
-                )
+                return json.dumps({"error": f"Team session '{session_id}' not found.",
+                                   "status": "not_resumed"})
             result = await resume_team_members(
-                session,
-                follow_up_task,
-                _registry,
-                resume_spawn,
-                _PROJECT_DIR,
+                session, follow_up_task, _registry, resume_spawn, _PROJECT_DIR,
             )
             if result["resumed_agents"] or result["queued_agents"]:
                 _get_team_store().upsert(session_id, session.to_dict())
             return json.dumps(result)
     except BlockingIOError:
-        return json.dumps(
-            {
-                "status": "busy",
-                "session_id": session_id,
-                "error": "A resume request for this team is already in progress.",
-            }
-        )
+        return json.dumps({"status": "busy", "session_id": session_id,
+                           "error": "A resume request for this team is already in progress."})
 
 
 if __name__ == "__main__":
