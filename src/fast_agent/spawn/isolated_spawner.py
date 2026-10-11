@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -279,7 +280,7 @@ async def _run_subprocess(
     except Exception:
         pass  # Best-effort PID tracking
 
-    stderr_lines: list[str] = []
+    stderr_lines: deque[str] = deque(maxlen=512)
 
     async def _read_stderr() -> None:
         assert process.stderr is not None
@@ -297,7 +298,12 @@ async def _run_subprocess(
                     from fast_agent.spawn.spawn_registry import SpawnRegistry, SpawnStatus
 
                     try:
-                        reg_path = Path(project_dir).resolve() / ".runtime" / "state" / "spawn_registry.json"
+                        reg_path = (
+                            Path(project_dir).resolve()
+                            / ".runtime"
+                            / "state"
+                            / "spawn_registry.json"
+                        )
                         event_registry = SpawnRegistry(registry_file=str(reg_path))
                         current = event_registry.get(run_id)
                         if current and current.status == SpawnStatus.CANCELLED.value:
@@ -305,24 +311,24 @@ async def _run_subprocess(
                         status = SpawnStatus.IDLE if evt.event == "idle" else SpawnStatus.RUNNING
                         event_registry.update_status(run_id, status)
                     except Exception:
-                        logger.warning("Failed to persist spawn lifecycle %s", evt.event, exc_info=True)
+                        logger.warning(
+                            "Failed to persist spawn lifecycle %s", evt.event, exc_info=True
+                        )
                 if evt and display_manager:
-                    display_manager.handle_event(evt)
+                    try:
+                        display_manager.handle_event(evt)
+                    except Exception:
+                        logger.warning(
+                            "Spawn display handler failed for %s/%s",
+                            run_id,
+                            evt.event,
+                            exc_info=True,
+                        )
                 elif not evt:
-                    stderr_lines.append(line)
-        except Exception as _crash_exc:
-            # CRITICAL: Log the crash that kills _read_stderr silently
-            logger.error("[_read_stderr] CRASHED after %d lines: %s", _stderr_count, _crash_exc, exc_info=True)
-            if _dbg_path:
-                try:
-                    import time as _tc
-                    import traceback as _tb
-                    with open(_dbg_path, "a") as _fc:
-                        _fc.write(f"{_tc.strftime('%H:%M:%S')} !!! CRASH after {_stderr_count} lines: {_crash_exc}\n")
-                        _fc.write(f"{_tc.strftime('%H:%M:%S')} Traceback:\n{''.join(_tb.format_exception(type(_crash_exc), _crash_exc, _crash_exc.__traceback__))}\n")
-                except Exception:
-                    pass
-
+                    stderr_lines.append(line[-4096:])
+        except Exception as exc:
+            logger.error("Spawn stderr reader failed for %s: %s", run_id, exc, exc_info=True)
+            stderr_lines.append(f"Spawn stderr reader failed: {type(exc).__name__}: {exc}"[:4096])
 
     try:
         stderr_task = asyncio.create_task(_read_stderr())
