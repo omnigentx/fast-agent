@@ -60,12 +60,21 @@ async def test_resume_spawn_reads_history_without_jarvis_import(monkeypatch, tmp
         )
     monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
     record = SimpleNamespace(
-        is_terminal=False, status="idle", lifecycle="resumable",
+        is_terminal=False,
+        status="idle",
+        lifecycle="resumable",
         original_config={"agent_name": "Taylor [Dev]", "env_vars": {"TEAM_SESSION_ID": "team-a"}},
-        agent_name="Taylor [Dev]", role="dev", team_name="team-a", restart_count=0,
+        agent_name="Taylor [Dev]",
+        role="dev",
+        team_name="team-a",
+        restart_count=0,
     )
     registry = SimpleNamespace(
-        get=lambda _: record, _data={}, _load=lambda: None, _save=lambda: None,
+        get=lambda _: record,
+        _data={},
+        _load=lambda: None,
+        _save=lambda: None,
+        has_running_resume=lambda *args, **kwargs: False,
     )
     monkeypatch.setattr(spawner, "_registry", registry)
     monkeypatch.setattr(spawner, "get_team_session", lambda _: None)
@@ -80,7 +89,5 @@ async def test_resume_spawn_reads_history_without_jarvis_import(monkeypatch, tmp
 
     assert result["new_run_id"] == "next-run"
     history_file = Path(observed["history_file"])
-    assert json.loads(history_file.read_text(encoding="utf-8")) == [
-        {"role": "user"}
-    ]
+    assert json.loads(history_file.read_text(encoding="utf-8")) == [{"role": "user"}]
     history_file.unlink()

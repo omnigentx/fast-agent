@@ -436,6 +436,13 @@ class LlmDecorator(StreamingAgentMixin, AgentProtocol):
             agent=self, request_params=effective_params, context=self._context, **additional_kwargs
         )
 
+        # Optional provider discovery finishes before content sanitization.
+        # Looking on the type avoids treating arbitrary dynamic mocks/proxies as
+        # a discovery provider; providers without the hook keep existing behavior.
+        refresh_metadata = getattr(type(self._llm), "refresh_model_info", None)
+        if refresh_metadata is not None:
+            await refresh_metadata(self._llm)
+
         # Store attachment details for future cloning
         self._llm_factory_ref = llm_factory
         attach_kwargs: dict[str, Any] = dict(additional_kwargs)

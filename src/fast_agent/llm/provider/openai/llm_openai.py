@@ -41,6 +41,7 @@ from fast_agent.llm.provider.openai._stream_capture import (
 from fast_agent.llm.provider.openai._stream_capture import (
     stream_capture_filename as _stream_capture_filename,
 )
+from fast_agent.llm.provider.openai.gateway_metadata import OpenAIGatewayMetadataMixin
 from fast_agent.llm.provider.openai.multipart_converter_openai import OpenAIConverter
 from fast_agent.llm.provider.openai.responses_files import ResponsesFileMixin
 from fast_agent.llm.provider.openai.schema_sanitizer import (
@@ -96,6 +97,7 @@ def _resolve_serving_model_window(serving_model: str | None) -> int | None:
 
 
 class OpenAILLM(
+    OpenAIGatewayMetadataMixin,
     OpenAIToolNotificationMixin,
     ResponsesFileMixin,
     OpenAIStructuredOutputMixin,
@@ -463,7 +465,6 @@ class OpenAILLM(
                     },
                 )
 
-
     def _process_stream_chunk_common(
         self,
         chunk: Any,
@@ -478,7 +479,7 @@ class OpenAILLM(
         estimated_tokens: int,
     ) -> tuple[str, int, bool, str | None]:
         """Process common streaming chunk logic shared by multiple stream processing methods.
-        
+
         Returns:
             Tuple of (cumulative_content, estimated_tokens, reasoning_active, incremental_content)
         """
@@ -524,7 +525,7 @@ class OpenAILLM(
                     model=model,
                     notified_tool_indices=notified_tool_indices,
                 )
-        
+
         return cumulative_content, estimated_tokens, reasoning_active, incremental
 
     def _finalize_tool_calls_on_stop(
@@ -792,6 +793,7 @@ class OpenAILLM(
         function_call = None
         finish_reason = None
         usage_data = None
+        response_model = model
 
         # Track tool call state for stream events
         tool_call_started: dict[int, dict[str, Any]] = {}
@@ -800,6 +802,8 @@ class OpenAILLM(
         # Process the stream chunks manually
         # Cancellation is handled via asyncio.Task.cancel() which raises CancelledError
         async for chunk in stream:
+            if getattr(chunk, "model", None):
+                response_model = chunk.model
             # Save chunk if stream capture is enabled
             _save_stream_chunk(capture_filename, chunk)
             # Process streaming events for tool calls
@@ -919,6 +923,7 @@ class OpenAILLM(
         final_completion.choices[0].message = message
         final_completion.choices[0].finish_reason = finish_reason
         final_completion.usage = usage_data
+        final_completion.model = response_model
 
         # Log final usage information
         if usage_data:
@@ -1076,7 +1081,9 @@ class OpenAILLM(
             and not isinstance(response, BaseException)
         ):
             try:
-                turn_usage = TurnUsage.from_openai(response.usage, model_name)
+                turn_usage = TurnUsage.from_openai(
+                    response.usage, getattr(response, "model", None) or model_name
+                )
                 self._finalize_turn_usage(turn_usage)
             except Exception as e:
                 self.logger.warning(f"Failed to track usage: {e}")

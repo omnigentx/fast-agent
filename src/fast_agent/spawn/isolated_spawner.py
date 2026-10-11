@@ -744,21 +744,23 @@ async def _resume_on_inbox_claimed(
     if not agent_name or not registry:
         logger.warning(
             "[AUTO-RESUME] Skipped %r: missing agent_name=%r or registry=%r",
-            agent_name, agent_name, bool(registry),
+            agent_name,
+            agent_name,
+            bool(registry),
         )
         return
 
     record = registry.get(run_id) if run_id else None
-    resume_session_id = (
-        (env_vars or {}).get("TEAM_SESSION_ID", "")
-        or (record.session_id if record else "")
+    resume_session_id = (env_vars or {}).get("TEAM_SESSION_ID", "") or (
+        record.session_id if record else ""
     )
     if record and resume_session_id and record.session_id != resume_session_id:
         raise ValueError("Auto-resume session does not match the spawn record")
 
     # Guard within the owning session; another team may reuse the same name.
     if registry.has_running_resume(
-        agent_name, resume_session_id,
+        agent_name,
+        resume_session_id,
         verify_process=bool(resume_session_id),
     ):
         logger.info(
@@ -786,6 +788,7 @@ async def _resume_on_inbox_claimed(
     # (no session segment) → 0 unread → silent exit → no respawn → the
     # meeting waited on ``Adrian [BA]`` forever.
     from pathlib import Path
+
     messages_dir: Path | None = None
     record = registry.get(run_id) if run_id else None
 
@@ -810,7 +813,8 @@ async def _resume_on_inbox_claimed(
                 logger.warning(
                     "[AUTO-RESUME] %s: TEAM_MESSAGES_DIR=%r is set but path "
                     "does not exist — trying session_id-derived path next",
-                    agent_name, explicit,
+                    agent_name,
+                    explicit,
                 )
 
     # 2. Canonical derivation from record.session_id + project_dir. This is
@@ -846,6 +850,7 @@ async def _resume_on_inbox_claimed(
             for line in ctx.split("\n"):
                 if "Shared Workspace" in line or "workspaces/" in line:
                     import re
+
                     match = re.search(r"(/\S+workspaces/\S+)", line)
                     if match:
                         workspace_dir = match.group(1)
@@ -854,7 +859,8 @@ async def _resume_on_inbox_claimed(
                             "context-text regex (%r) — structured env_vars "
                             "and session_id both missing. Spawn record may "
                             "be from a legacy code path; consider re-spawning.",
-                            agent_name, workspace_dir,
+                            agent_name,
+                            workspace_dir,
                         )
                         break
 
@@ -863,7 +869,8 @@ async def _resume_on_inbox_claimed(
                 "[AUTO-RESUME] %s: no TEAM_MESSAGES_DIR (param or stored), "
                 "no session_id-derived path, no TEAM_WORKSPACE, no workspace "
                 "in original_config.context — cannot locate inbox to check. "
-                "Agent will NOT be respawned.", agent_name,
+                "Agent will NOT be respawned.",
+                agent_name,
             )
             return
 
@@ -879,43 +886,35 @@ async def _resume_on_inbox_claimed(
             "[AUTO-RESUME] %s: resolved messages_dir=%r does not exist — "
             "agent will NOT be respawned (likely env_vars stale or workspace "
             "moved). Verify TEAM_MESSAGES_DIR in spawn_registry.original_config.",
-            agent_name, str(messages_dir) if messages_dir else None,
+            agent_name,
+            str(messages_dir) if messages_dir else None,
         )
         return
 
     from fast_agent.spawn.message_bus import MessageBus
+
     bus = MessageBus(messages_dir=str(messages_dir))
     unread = bus.read_unread(agent_name)
 
     if not unread:
         logger.info(
             "[AUTO-RESUME] %s: 0 unread messages at %s — nothing to resume for",
-            agent_name, str(messages_dir),
+            agent_name,
+            str(messages_dir),
         )
         return
 
     logger.info(
         "📬 %s has %d unread message(s) — auto-resuming",
-        agent_name, len(unread),
+        agent_name,
+        len(unread),
     )
 
-    # Format inbox messages as follow-up task
-    inbox_lines = [f"## New Messages ({len(unread)} unread)\n"]
-    for msg in unread:
-        inbox_lines.append(
-            f"### From {msg.from_name} [{msg.message_type}] (id: {msg.message_id})\n"
-            f"{msg.content}\n"
-        )
-    inbox_lines.append(
-        "\n## Instructions\n"
-        "You have new messages. Follow these steps:\n"
-        "1. Read ALL messages above to understand the overall situation\n"
-        "2. Prioritize: bugs > tasks > questions > responses\n"
-        "3. For each message: take action if needed, then reply using "
-        "`reply_to_message(to=sender, message=your_response, original_message_id=id)`\n"
-        "4. When all messages are handled, finish your work"
-    )
-    follow_up = "\n".join(inbox_lines)
+    from fast_agent.spawn.inbox_delivery import format_inbox_text, needs_attention
+
+    if not any(needs_attention(message) for message in unread):
+        return  # FYI remains durable; consume it with the next actionable turn.
+    follow_up = format_inbox_text(unread)
 
     # Resume the agent
     record = registry.get(run_id)
@@ -934,7 +933,9 @@ async def _resume_on_inbox_claimed(
         # load_history_into_agent(). Resume task is just the new messages.
         enriched_context = follow_up
         logger.info(
-            "📂 Found previous history for %s: %s", agent_name, history_file,
+            "📂 Found previous history for %s: %s",
+            agent_name,
+            history_file,
         )
     else:
         # No history file — fall back to text-based context
@@ -950,7 +951,8 @@ async def _resume_on_inbox_claimed(
         enriched_parts.append(follow_up)
         enriched_context = "\n\n".join(enriched_parts)
         logger.info(
-            "⚠️ No history file for %s — using text-based context", agent_name,
+            "⚠️ No history file for %s — using text-based context",
+            agent_name,
         )
 
     # Determine correct project_dir from original_config (fixes Unknown MCP servers)
@@ -965,6 +967,7 @@ async def _resume_on_inbox_claimed(
     if team_session_id:
         try:
             from fast_agent.spawn.team_spawner import get_team_session
+
             session = get_team_session(team_session_id)
             if session:
                 role = cfg.get("role", "")
@@ -972,7 +975,8 @@ async def _resume_on_inbox_claimed(
                 enriched_context = roster_ctx + "\n\n" + enriched_context
                 logger.info(
                     "📋 Re-injected team context for %s (session %s)",
-                    agent_name, team_session_id,
+                    agent_name,
+                    team_session_id,
                 )
         except Exception as e:
             logger.warning("Failed to re-inject team context: %s", e)
@@ -996,28 +1000,24 @@ async def _resume_on_inbox_claimed(
     #     team_sessions[session_id].team_name (the canonical SSoT). This both
     #     stops new drift AND recovers records already mid-drift.
     env_vars_cfg = cfg.get("env_vars") or {}
-    resume_session_id = (
-        env_vars_cfg.get("TEAM_SESSION_ID", "")
-        or (record.session_id if record else "")
+    resume_session_id = env_vars_cfg.get("TEAM_SESSION_ID", "") or (
+        record.session_id if record else ""
     )
-    resume_team_name = (
-        cfg.get("team_name", "")
-        or (record.team_name if record else "")
-    )
+    resume_team_name = cfg.get("team_name", "") or (record.team_name if record else "")
     resume_server_overrides = cfg.get("server_overrides") or None
     resume_workspace_dir = cfg.get("workspace_dir") or None
-    if resume_session_id and (
-        not resume_team_name or not resume_server_overrides
-    ):
+    if resume_session_id and (not resume_team_name or not resume_server_overrides):
         try:
             from fast_agent.spawn.team_spawner import get_team_session
+
             sess = get_team_session(resume_session_id)
             if sess:
                 if not resume_team_name and sess.team_name:
                     resume_team_name = sess.team_name
                     logger.info(
                         "[AUTO-RESUME] %s: recovered team_name=%r via team_sessions DB lookup",
-                        agent_name, resume_team_name,
+                        agent_name,
+                        resume_team_name,
                     )
                 # server_overrides SSoT lives in team_sessions.template.roles[<role>]
                 # — restore from there if cfg lost it through the cascade.
@@ -1030,19 +1030,22 @@ async def _resume_on_inbox_claimed(
                         resume_server_overrides = role_overrides
                         logger.info(
                             "[AUTO-RESUME] %s: recovered server_overrides for role=%r via team_sessions DB lookup",
-                            agent_name, role_key,
+                            agent_name,
+                            role_key,
                         )
                 # workspace_dir SSoT is the team session's workspace path.
                 if not resume_workspace_dir and getattr(sess, "workspace", None):
                     resume_workspace_dir = str(sess.workspace)
                     logger.info(
                         "[AUTO-RESUME] %s: recovered workspace_dir=%r via team_sessions DB lookup",
-                        agent_name, resume_workspace_dir,
+                        agent_name,
+                        resume_workspace_dir,
                     )
         except Exception as e:
             logger.warning(
                 "[AUTO-RESUME] %s: team DB recovery failed: %s",
-                agent_name, e,
+                agent_name,
+                e,
             )
     if not resume_session_id or not resume_team_name:
         # Log loud — without these the new run is invisible to the bridge's
@@ -1051,7 +1054,9 @@ async def _resume_on_inbox_claimed(
             "[AUTO-RESUME] %s: missing session_id=%r or team_name=%r after "
             "recovery — spawn_progress_bridge filtering will fail. "
             "Investigate the original spawn record.",
-            agent_name, resume_session_id, resume_team_name,
+            agent_name,
+            resume_session_id,
+            resume_team_name,
         )
 
     handoff_env_vars = dict(env_vars or {})
@@ -1099,14 +1104,20 @@ async def _resume_on_inbox_claimed(
     if spawn_lifecycle_hooks:
         await _safe_hook(
             spawn_lifecycle_hooks.on_auto_resume(
-                run_id, agent_name, new_run_id, "inbox_messages",
+                run_id,
+                agent_name,
+                new_run_id,
+                "inbox_messages",
             ),
-            "on_auto_resume", run_id,
+            "on_auto_resume",
+            run_id,
         )
 
     logger.info(
         "📬 %s auto-resumed as %s to process %d message(s)",
-        agent_name, new_run_id, len(unread),
+        agent_name,
+        new_run_id,
+        len(unread),
     )
 
 

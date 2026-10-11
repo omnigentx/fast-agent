@@ -49,6 +49,7 @@ from fast_agent.spawn.isolated_spawner import (
     run_isolated_agent,
     run_isolated_agent_background,
 )
+from fast_agent.spawn.live_resume import guard_member_resume
 from fast_agent.spawn.message_bus import MessageBus
 from fast_agent.spawn.spawn_display import get_display_manager
 from fast_agent.spawn.spawn_registry import SpawnRegistry
@@ -508,9 +509,6 @@ async def spawn_and_run_background(
 # ───────────────────────────────────────────────────────────
 
 
-
-
-
 @mcp.tool()
 def list_active_spawns() -> str:
     """List all tracked spawns and their status."""
@@ -620,6 +618,7 @@ async def restart_spawn(run_id: str) -> str:
 
 
 @mcp.tool()
+@guard_member_resume
 async def resume_spawn(run_id: str, follow_up_task: str) -> str:
     """Continue a completed resumable spawn with follow-up.
 
@@ -659,6 +658,14 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
     if not cfg:
         return json.dumps({"error": (f"No saved config for spawn '{run_id}'. Cannot resume.")})
 
+    # Idle resumable processes are alive. An explicit resume must use the
+    # same inbox/channel as team resume rather than create a second consumer.
+    from fast_agent.spawn.live_resume import queue_live_follow_up
+
+    delivered = queue_live_follow_up(_registry, record, run_id, follow_up_task)
+    if delivered is not None:
+        return delivered
+
     agent_name = cfg.get("agent_name", record.agent_name)
 
     # Single source of truth for resumable-agent conversation history:
@@ -676,14 +683,16 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
     session_id = (cfg.get("env_vars") or {}).get("TEAM_SESSION_ID")
     snapshot_json = load_latest_context_json(agent_name, session_id=session_id)
     if not snapshot_json:
-        return json.dumps({
-            "error": (
-                f"No conversation snapshot found for agent '{agent_name}' "
-                f"(run_id={run_id}). The agent never produced a "
-                "task_complete snapshot, so its history can't be restored. "
-                "Use restart_spawn to re-run the original task from scratch."
-            )
-        })
+        return json.dumps(
+            {
+                "error": (
+                    f"No conversation snapshot found for agent '{agent_name}' "
+                    f"(run_id={run_id}). The agent never produced a "
+                    "task_complete snapshot, so its history can't be restored. "
+                    "Use restart_spawn to re-run the original task from scratch."
+                )
+            }
+        )
 
     fd, history_file = tempfile.mkstemp(
         prefix=f"resume_{agent_name.replace(' ', '_')}_",
@@ -693,7 +702,8 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
         fh.write(snapshot_json)
     logger.info(
         "📂 resume_spawn: materialized snapshot for %s -> %s",
-        agent_name, history_file,
+        agent_name,
+        history_file,
     )
 
     # FastAgent's native ``load_history_into_agent`` will hydrate
@@ -716,7 +726,8 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
                 enriched_context = roster_ctx + "\n\n" + enriched_context
                 logger.info(
                     "📋 Re-injected team context for %s (session %s)",
-                    agent_name, team_session_id,
+                    agent_name,
+                    team_session_id,
                 )
         except Exception as e:
             logger.warning("Failed to re-inject team context: %s", e)
@@ -761,9 +772,6 @@ async def resume_spawn(run_id: str, follow_up_task: str) -> str:
             ),
         }
     )
-
-
-
 
 
 # ───────────────────────────────────────────────────────────
@@ -1007,9 +1015,6 @@ def spawn_agent(
                 "message": f"Unexpected error: {e}",
             }
         )
-
-
-
 
 
 @mcp.tool()
@@ -1543,8 +1548,6 @@ def list_team_templates_tool() -> str:
     """List all available team templates."""
     templates = _list_templates(template_dir=str(_PROJECT_DIR / "team_templates"))
     return json.dumps({"count": len(templates), "templates": templates})
-
-
 
 
 # ───────────────────────────────────────────────────────────

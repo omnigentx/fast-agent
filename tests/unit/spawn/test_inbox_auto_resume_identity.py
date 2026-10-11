@@ -9,6 +9,7 @@ invisible to ``spawn_progress_bridge.find_by_team_name(...) ∩ session_id``.
 
 These tests pin the recovery so the cascade can't silently come back.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fast_agent.spawn import isolated_spawner
+from fast_agent.spawn.message_bus import AgentMessage
 from fast_agent.spawn.spawn_registry import SpawnRecord
 
 if TYPE_CHECKING:
@@ -80,8 +82,11 @@ def _make_record(
 def mock_message_bus(monkeypatch):
     """MessageBus.read_unread returns ONE unread message so resume fires."""
     unread = [
-        SimpleNamespace(
-            from_name="PM", message_type="email", message_id="m1",
+        AgentMessage(
+            from_name="PM",
+            message_type="email",
+            message_id="m1",
+            to_name="Phoenix [Dev]",
             content="please continue",
         ),
     ]
@@ -89,13 +94,15 @@ def mock_message_bus(monkeypatch):
     bus_instance.read_unread.return_value = unread
     bus_instance.mark_all_done.return_value = None
     monkeypatch.setattr(
-        isolated_spawner, "MessageBus" if hasattr(isolated_spawner, "MessageBus") else "",
+        isolated_spawner,
+        "MessageBus" if hasattr(isolated_spawner, "MessageBus") else "",
         MagicMock(return_value=bus_instance),
         raising=False,
     )
     # ``_check_and_resume_on_inbox`` imports MessageBus inside the function;
     # patch the module it imports from.
     import fast_agent.spawn.message_bus as mb_mod
+
     monkeypatch.setattr(mb_mod, "MessageBus", MagicMock(return_value=bus_instance))
     return bus_instance
 
