@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
+from mcp.types import (
+    BlobResourceContents,
+    ContentBlock,
+    EmbeddedResource,
+    ImageContent,
+    TextContent,
+)
+from pydantic import AnyUrl
 
 from fast_agent.spawn.message_bus import AgentMessage
 from fast_agent.types import PromptMessageExtended
@@ -39,7 +46,7 @@ def format_inbox_text(messages: list[AgentMessage]) -> str:
 def build_inbox_prompt(
     messages: list[AgentMessage], *, text: str | None = None
 ) -> PromptMessageExtended:
-    parts = [
+    parts: list[ContentBlock] = [
         TextContent(type="text", text=text if text is not None else format_inbox_text(messages))
     ]
     for message in messages:
@@ -52,10 +59,18 @@ def build_inbox_prompt(
                     EmbeddedResource(
                         type="resource",
                         resource=BlobResourceContents(
-                            uri=f"attachment://{message.message_id}/{attachment['filename']}",
+                            uri=AnyUrl(f"attachment://{message.message_id}/{attachment['filename']}"),
                             mimeType=mime,
                             blob=attachment["data_b64"],
                         ),
                     )
                 )
-    return PromptMessageExtended(role="user", content=parts)
+    return PromptMessageExtended(
+        role="user",
+        content=parts,
+        channels={
+            "fast-agent-inbox-envelope-ids": [
+                TextContent(type="text", text=message.message_id) for message in messages
+            ]
+        },
+    )

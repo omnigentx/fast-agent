@@ -88,6 +88,27 @@ class InboxWatcherHook:
             self._pending_runner = None
             self._pending_ids = []
 
+        # Keep-alive and recovery may already have supplied an inbox prompt.
+        # Stage its acknowledgement without appending the same envelope again.
+        # Metadata stays out of provider content and survives typed attachments.
+        present_ids = {
+            block.text
+            for message in messages
+            for block in (getattr(message, "channels", None) or {}).get(
+                "fast-agent-inbox-envelope-ids", []
+            )
+            if getattr(block, "type", None) == "text"
+        }
+        represented = [
+            m.message_id for m in unread
+            if m.message_id in present_ids
+            and m.message_id not in self._injected_ids
+            and m.message_id not in self._pending_ids
+        ]
+        if represented:
+            self._pending_runner = runner
+            self._pending_ids.extend(represented)
+
         # Filter already-acknowledged and pending messages (safety dedup).
         new_messages = [
             m
