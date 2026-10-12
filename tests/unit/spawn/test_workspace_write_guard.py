@@ -176,3 +176,31 @@ def test_real_process_claim_and_crash_recovery(tmp_path):
             process.join(5)
         process.close()
         parent.close()
+
+
+@pytest.mark.parametrize(
+    "payload", [b"\x89PNG\r\n\x1a\n", b"%PDF-1.7\n", b"ID3\x04", b"PK\x03\x04", b"bad\x00text"]
+)
+def test_binary_text_read_is_rejected_before_mcp(tmp_path, payload):
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(payload)
+    guard = WorkspaceWriteGuard(tmp_path, "QE")
+    with pytest.raises(RuntimeError, match="read_media_file"):
+        guard.before(request("read_text_file", path))
+    guard.before(request("read_media_file", path))
+
+
+def test_utf8_multibyte_at_sample_boundary_is_not_binary(tmp_path):
+    path = tmp_path / "chapter.txt"
+    path.write_text("a" * 4095 + "ế tiếng Việt")
+    WorkspaceWriteGuard(tmp_path, "QE").before(request("read_text_file", path))
+
+
+def test_mixed_multiple_read_rejects_binary(tmp_path):
+    text, image = tmp_path / "code.js", tmp_path / "screen.png"
+    text.write_text("const result = true;")
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    batch = request("read_multiple_files", text)
+    batch.tool_calls["call"].params.arguments = {"paths": [str(text), str(image)]}
+    with pytest.raises(RuntimeError, match="read_media_file"):
+        WorkspaceWriteGuard(tmp_path, "QE").before(batch)

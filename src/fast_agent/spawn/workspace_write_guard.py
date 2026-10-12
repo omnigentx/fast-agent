@@ -100,6 +100,11 @@ class WorkspaceWriteGuard:
             if operation is None:
                 continue
             paths = self._paths(operation, call.params.arguments or {})
+            if operation in _READS:
+                from fast_agent.spawn.text_read_guard import require_text_file
+
+                for path in paths:
+                    require_text_file(path)
             self._pending[call_id] = (operation, paths, [_version(path) for path in paths])
             if operation in _WRITES:
                 writes.update(paths)
