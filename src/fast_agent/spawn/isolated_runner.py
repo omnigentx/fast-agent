@@ -68,6 +68,8 @@ async def _send_pending_and_ack(
     trigger: str,
     bus: Any,
     message_ids: list[str],
+    *,
+    team_name: str = "",
 ) -> Any:
     """Commit inbox delivery only after the agent turn has succeeded.
 
@@ -76,7 +78,7 @@ async def _send_pending_and_ack(
     replay a turn; delivery is at least once rather than silently lost.
     """
     response = await agent.send(pending)
-    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger)
+    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger, team_name=team_name)
     if bus is not None:
         for message_id in message_ids:
             bus.mark_done(agent_name, message_id)
@@ -473,6 +475,8 @@ async def _save_agent_context_snapshot(
     run_id: str,
     agent_name: str,
     trigger: str,
+    *,
+    team_name: str = "",
 ) -> None:
     """Save agent context window to SQLite — never raises.
 
@@ -510,7 +514,7 @@ async def _save_agent_context_snapshot(
             trigger=trigger,
             agent_name=agent_name,
             session_id=_os.environ.get("TEAM_SESSION_ID"),
-            team_name=_os.environ.get("TEAM_MY_ROLE", ""),
+            team_name=team_name,
         )
     except Exception as _ctx_exc:
         import sys as _sys
@@ -811,6 +815,7 @@ async def run_child_agent(
                                     "task_complete" if is_first_iter else "idle",
                                     bus,
                                     pending_message_ids,
+                                    team_name=team_name,
                                 )
                             except Exception as _send_exc:
                                 import sys

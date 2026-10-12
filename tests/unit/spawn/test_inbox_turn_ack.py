@@ -32,7 +32,7 @@ async def test_successful_send_persists_before_ack(monkeypatch):
     bus = Mock()
     bus.mark_done.side_effect = lambda *_: order.append("ack")
 
-    async def save(*_):
+    async def save(*_, **kwargs):
         order.append("snapshot")
 
     monkeypatch.setattr(isolated_runner, "_save_agent_context_snapshot", save)
@@ -41,3 +41,25 @@ async def test_successful_send_persists_before_ack(monkeypatch):
     )
 
     assert order == ["send", "snapshot", "ack"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_preserves_team_name_not_role(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    save = AsyncMock()
+    service = ModuleType("services.context_persistence")
+    service.save_agent_context = save
+    monkeypatch.setitem(sys.modules, "services.context_persistence", service)
+    monkeypatch.setenv("TEAM_MY_ROLE", "dev")
+    monkeypatch.setenv("TEAM_SESSION_ID", "team-session")
+    agent = Mock()
+    agent.message_history = []
+    agent.send = AsyncMock(return_value="completed")
+    await isolated_runner._send_pending_and_ack(
+        agent, "request", "run-a", "Alex", "idle", None, [],
+        team_name="game-team",
+    )
+    assert save.await_args.kwargs["team_name"] == "game-team"
+    assert save.await_args.kwargs["session_id"] == "team-session"
