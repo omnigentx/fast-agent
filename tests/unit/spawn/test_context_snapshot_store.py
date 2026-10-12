@@ -60,12 +60,21 @@ async def test_resume_spawn_reads_history_without_jarvis_import(monkeypatch, tmp
         )
     monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
     record = SimpleNamespace(
-        is_terminal=False, status="idle", lifecycle="resumable",
+        is_terminal=False,
+        status="idle",
+        lifecycle="resumable",
         original_config={"agent_name": "Taylor [Dev]", "env_vars": {"TEAM_SESSION_ID": "team-a"}},
-        agent_name="Taylor [Dev]", role="dev", team_name="team-a", restart_count=0,
+        agent_name="Taylor [Dev]",
+        role="dev",
+        team_name="team-a",
+        restart_count=0,
     )
     registry = SimpleNamespace(
-        get=lambda _: record, _data={}, _load=lambda: None, _save=lambda: None,
+        get=lambda _: record,
+        _data={},
+        _load=lambda: None,
+        _save=lambda: None,
+        has_running_resume=lambda *args, **kwargs: False,
     )
     monkeypatch.setattr(spawner, "_registry", registry)
     monkeypatch.setattr(spawner, "get_team_session", lambda _: None)
@@ -80,7 +89,30 @@ async def test_resume_spawn_reads_history_without_jarvis_import(monkeypatch, tmp
 
     assert result["new_run_id"] == "next-run"
     history_file = Path(observed["history_file"])
-    assert json.loads(history_file.read_text(encoding="utf-8")) == [
-        {"role": "user"}
-    ]
+    assert json.loads(history_file.read_text(encoding="utf-8")) == [{"role": "user"}]
     history_file.unlink()
+
+
+def test_newest_owned_working_snapshot_then_newer_raw(monkeypatch, tmp_path):
+    db_path = tmp_path / "history.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE agent_context_snapshots(id INTEGER, agent_name TEXT, session_id TEXT, context_json TEXT, created_at REAL)"
+        )
+        connection.execute(
+            "CREATE TABLE context_compaction_events(id INTEGER, agent_name TEXT, session_id TEXT, working_context_json TEXT, status TEXT, created_at REAL)"
+        )
+        connection.execute("INSERT INTO agent_context_snapshots VALUES(1, 'QE', 'a', 'raw', 1)")
+        connection.executemany(
+            "INSERT INTO context_compaction_events VALUES(?, 'QE', ?, ?, ?, ?)",
+            [
+                (1, "a", "compact", "completed", 2),
+                (2, "other", "foreign", "completed", 5),
+                (3, "a", "failed", "failed", 6),
+            ],
+        )
+    monkeypatch.setenv("SPAWN_REGISTRY_DB", str(db_path))
+    assert load_latest_context_json("QE", session_id="a") == "compact"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("INSERT INTO agent_context_snapshots VALUES(2, 'QE', 'a', 'new raw', 3)")
+    assert load_latest_context_json("QE", session_id="a") == "new raw"

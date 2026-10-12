@@ -43,7 +43,8 @@ def send_email(
 
     Unlike meetings (which require turn-taking), this is fire-and-forget.
     The email is queued and the recipient reads it when available.
-    If the recipient is idle, they are auto-woken.
+    Actionable primary messages wake idle recipients. FYI/no-reply and CC
+    copies are retained until their next task.
 
     Use this for: quick questions, notifications, status updates,
     blocker alerts, or any message that doesn't need a formal meeting.
@@ -112,10 +113,12 @@ def send_email(
                 "subject": subject,
                 "batch_id": batch_id,
                 "recipient_type": "to",
+                "primary_recipients": recipients,
                 "no_reply": no_reply,
             },
         )
-        auto_wake_if_idle(recipient)
+        if not no_reply:
+            auto_wake_if_idle(recipient)
         sent.append({"to": recipient, "message_id": msg.message_id, "type": "to"})
 
     # CC recipients — informational copy
@@ -138,10 +141,10 @@ def send_email(
                     "subject": subject,
                     "batch_id": batch_id,
                     "recipient_type": "cc",
+                    "primary_recipients": recipients,
                     "no_reply": no_reply,
                 },
             )
-            auto_wake_if_idle(recipient)
             cc_sent.append({"to": recipient, "message_id": msg.message_id, "type": "cc"})
 
     result: dict[str, Any] = {

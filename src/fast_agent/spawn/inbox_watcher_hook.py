@@ -88,6 +88,27 @@ class InboxWatcherHook:
             self._pending_runner = None
             self._pending_ids = []
 
+        # Keep-alive and recovery may already have supplied an inbox prompt.
+        # Stage its acknowledgement without appending the same envelope again.
+        # Metadata stays out of provider content and survives typed attachments.
+        present_ids = {
+            block.text
+            for message in messages
+            for block in (getattr(message, "channels", None) or {}).get(
+                "fast-agent-inbox-envelope-ids", []
+            )
+            if getattr(block, "type", None) == "text"
+        }
+        represented = [
+            m.message_id for m in unread
+            if m.message_id in present_ids
+            and m.message_id not in self._injected_ids
+            and m.message_id not in self._pending_ids
+        ]
+        if represented:
+            self._pending_runner = runner
+            self._pending_ids.extend(represented)
+
         # Filter already-acknowledged and pending messages (safety dedup).
         new_messages = [
             m
@@ -99,7 +120,9 @@ class InboxWatcherHook:
 
         # Take batch, remaining stay unread for next inject cycle
         batch = new_messages[: self.max_per_inject]
-        inject_text = self._format_messages(batch)
+        from fast_agent.spawn.inbox_delivery import build_inbox_prompt
+
+        inject_text = build_inbox_prompt(batch)
         runner.append_messages(inject_text)
 
         self._pending_runner = runner
@@ -141,50 +164,29 @@ class InboxWatcherHook:
 
     @staticmethod
     def _format_messages(messages: list[AgentMessage]) -> str:
-        """Format messages for LLM context injection."""
-        priority_icons = {
-            "urgent": "🔴",
-            "high": "🟠",
-            "normal": "🟢",
-            "low": "⚪",
-        }
+        """Render routing metadata consistently with keep-alive and recovery."""
+        from fast_agent.spawn.inbox_delivery import format_inbox_text
 
-        lines = [
-            "\n━━━ 📬 NEW MESSAGES RECEIVED ━━━",
-            f"You have {len(messages)} new message(s):\n",
-        ]
-
-        for msg in messages:
-            icon = priority_icons.get(msg.priority, "🟢")
-            lines.append(f"{icon} [{msg.message_type.upper()}] from {msg.from_name}:")
-            lines.append(f"  {msg.content}")
-            if msg.reply_to:
-                lines.append(f"  (reply to: {msg.reply_to})")
-            lines.append("")
-
-        lines.append(
-            "→ Review these messages and decide how to handle them. "
-            "You may continue your current task if it has higher priority, "
-            "or switch to handle urgent messages first — use your judgment."
-        )
-        lines.append("━━━━━━━━━━━━━━━━━━━━\n")
-
-        return "\n".join(lines)
+        return format_inbox_text(messages)
 
 
 def create_inbox_watcher() -> InboxWatcherHook | None:
     """Factory: create InboxWatcherHook from environment variables.
 
-    Returns None if TEAM_MY_NAME or TEAM_WORKSPACE are not set.
+    Prefer the session-scoped directory provided to team writers. The legacy
+    workspace inbox is used only when no explicit directory was configured.
     """
     agent_name = os.environ.get("TEAM_MY_NAME", "")
+    explicit_dir = os.environ.get("TEAM_MESSAGES_DIR", "")
     workspace = os.environ.get("TEAM_WORKSPACE", "")
 
-    if not agent_name or not workspace:
+    if not agent_name or (not explicit_dir and not workspace):
         return None
 
-    messages_dir = Path(workspace) / ".messages"
-    if not messages_dir.exists():
+    messages_dir = Path(explicit_dir) if explicit_dir else Path(workspace) / ".messages"
+    if not messages_dir.is_dir():
+        if explicit_dir:
+            logger.warning("RTAC: configured session inbox is unavailable: %s", messages_dir)
         return None
 
     return InboxWatcherHook(

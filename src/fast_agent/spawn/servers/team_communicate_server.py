@@ -320,6 +320,20 @@ def reply_to_message(
         return _err
     resolved = to
 
+    if original_message_id:
+        original = next(
+            (item for item in bus.read_inbox(my_name) if item.message_id == original_message_id),
+            None,
+        )
+        if original is not None and (original.context or {}).get("no_reply") is True:
+            return json.dumps(
+                {
+                    "status": "not_sent",
+                    "reason": "Original message is informational and requests no reply. Continue your task.",
+                    "reply_to": original_message_id,
+                }
+            )
+
     msg = bus.send(
         from_name=my_name,
         to_name=resolved,
@@ -335,13 +349,15 @@ def reply_to_message(
     # Auto-wake if receiver is idle
     _auto_wake_if_idle(resolved)
 
-    return json.dumps({
-        "status": "sent",
-        "message_id": msg.message_id,
-        "from": my_name,
-        "to": resolved,
-        "reply_to": original_message_id,
-    })
+    return json.dumps(
+        {
+            "status": "sent",
+            "message_id": msg.message_id,
+            "from": my_name,
+            "to": resolved,
+            "reply_to": original_message_id,
+        }
+    )
 
 
 if __name__ == "__main__":

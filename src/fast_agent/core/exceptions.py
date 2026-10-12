@@ -102,3 +102,12 @@ class ServerSessionTerminatedError(FastAgentError):
         self.server_name = server_name
         message = f"MCP server '{server_name}' session terminated"
         super().__init__(message, details)
+
+
+class RecoverableToolError(RuntimeError):
+    """A hook rejected a tool call with actionable feedback for the next LLM step.
+
+    Execution has not started. The whole batch receives ordinary tool errors,
+    allowing the model to choose a suitable tool without terminating the turn.
+    Unexpected hook failures retain the existing terminal error behaviour.
+    """

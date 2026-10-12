@@ -20,10 +20,12 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from fast_agent.spawn.config_reader import get_available_servers
+from fast_agent.spawn.process_tree import SpawnProcessTree, registered_process_tree
 from fast_agent.spawn.runtime_paths import get_runtime_paths
 from fast_agent.spawn.spawn_events import SpawnEvent
 from fast_agent.spawn.spawn_hooks import (
@@ -41,6 +43,8 @@ DEFAULT_TIMEOUT_SECONDS = 0  # 0 = no timeout (agents run forever, cleaned up on
 # Track background tasks and their subprocesses
 _background_tasks: dict[str, asyncio.Task[None]] = {}
 _background_processes: dict[str, asyncio.subprocess.Process] = {}
+_background_process_trees: dict[str, SpawnProcessTree] = {}
+_EXPLICIT_CANCEL = "explicit_spawn_cancel"
 
 
 def _find_latest_history(workspace_dir: str) -> str | None:
@@ -231,6 +235,7 @@ async def _run_subprocess(
     )
 
     _background_processes[run_id] = process
+    _background_process_trees[run_id] = SpawnProcessTree(process.pid)
 
     # ┌─────────────────────────────────────────────────────────────────┐
     # │ ⚠️  PID gotcha — read before changing pause/resume signal code  │
@@ -268,11 +273,14 @@ async def _run_subprocess(
         pid_reg._load()
         if run_id in pid_reg._data:
             pid_reg._data[run_id]["pid"] = process.pid
+            pid_reg._data[run_id].setdefault("metadata", {})["spawn_pid_birth"] = (
+                _background_process_trees[run_id].root.create_time()
+            )
             pid_reg._save()
     except Exception:
         pass  # Best-effort PID tracking
 
-    stderr_lines: list[str] = []
+    stderr_lines: deque[str] = deque(maxlen=512)
 
     async def _read_stderr() -> None:
         assert process.stderr is not None
@@ -284,67 +292,43 @@ async def _run_subprocess(
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 evt = SpawnEvent.from_line(line)
 
-                if evt and display_manager:
-                    display_manager.handle_event(evt)
                 if evt and evt.event in ("idle", "resumed"):
-                    # Update registry in real-time for keep-alive agents
-                    # so the UI reflects idle/running status immediately
+                    # Read on a lifecycle event, not a timer. The durable store
+                    # fences late events from workers cancelled by another MCP.
+                    from fast_agent.spawn.spawn_registry import SpawnRegistry, SpawnStatus
+
                     try:
-                        from fast_agent.spawn.spawn_registry import (
-                            SpawnRegistry,
-                            SpawnStatus,
+                        reg_path = (
+                            Path(project_dir).resolve()
+                            / ".runtime"
+                            / "state"
+                            / "spawn_registry.json"
                         )
-                        reg_path = Path(project_dir).resolve() / ".runtime" / "state" / "spawn_registry.json"
-                        _rt_reg = SpawnRegistry(registry_file=str(reg_path))
-                        _new_status = SpawnStatus.IDLE if evt.event == "idle" else SpawnStatus.RUNNING
-                        _rt_reg.update_status(run_id, _new_status)
-                    except Exception as e:
-                        logger.warning("Failed to update JSON registry on %s: %s", evt.event, e)
-
-                    # Also update SQLite AgentRegistryDB directly — the socket
-                    # pipeline (stderr→display→socket→bridge) can silently fail,
-                    # so this is the authoritative backup for UI status.
+                        event_registry = SpawnRegistry(registry_file=str(reg_path))
+                        current = event_registry.get(run_id)
+                        if current and current.status == SpawnStatus.CANCELLED.value:
+                            continue
+                        status = SpawnStatus.IDLE if evt.event == "idle" else SpawnStatus.RUNNING
+                        event_registry.update_status(run_id, status)
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist spawn lifecycle %s", evt.event, exc_info=True
+                        )
+                if evt and display_manager:
                     try:
-                        db_path = os.environ.get("SPAWN_REGISTRY_DB")
-                        if db_path:
-                            import sqlite3 as _sqlite3
-                            _db_status = "idle" if evt.event == "idle" else "running"
-                            _conn = _sqlite3.connect(db_path, timeout=5)
-                            _row = _conn.execute(
-                                "SELECT data_json FROM spawn_registry WHERE run_id = ?",
-                                (run_id,),
-                            ).fetchone()
-                            if _row:
-                                import json as _json
-                                _rec = _json.loads(_row[0])
-                                _rec["status"] = _db_status
-                                _conn.execute(
-                                    "INSERT OR REPLACE INTO spawn_registry (run_id, data_json) VALUES (?, ?)",
-                                    (run_id, _json.dumps(_rec, ensure_ascii=False)),
-                                )
-                                _conn.commit()
-                                logger.info(
-                                    "Updated AgentRegistryDB: run_id=%s → %s",
-                                    run_id, _db_status,
-                                )
-                            _conn.close()
-                    except Exception as e:
-                        logger.warning("Failed to update AgentRegistryDB on %s: %s", evt.event, e)
+                        display_manager.handle_event(evt)
+                    except Exception:
+                        logger.warning(
+                            "Spawn display handler failed for %s/%s",
+                            run_id,
+                            evt.event,
+                            exc_info=True,
+                        )
                 elif not evt:
-                    stderr_lines.append(line)
-        except Exception as _crash_exc:
-            # CRITICAL: Log the crash that kills _read_stderr silently
-            logger.error("[_read_stderr] CRASHED after %d lines: %s", _stderr_count, _crash_exc, exc_info=True)
-            if _dbg_path:
-                try:
-                    import time as _tc
-                    import traceback as _tb
-                    with open(_dbg_path, "a") as _fc:
-                        _fc.write(f"{_tc.strftime('%H:%M:%S')} !!! CRASH after {_stderr_count} lines: {_crash_exc}\n")
-                        _fc.write(f"{_tc.strftime('%H:%M:%S')} Traceback:\n{''.join(_tb.format_exception(type(_crash_exc), _crash_exc, _crash_exc.__traceback__))}\n")
-                except Exception:
-                    pass
-
+                    stderr_lines.append(line[-4096:])
+        except Exception as exc:
+            logger.error("Spawn stderr reader failed for %s: %s", run_id, exc, exc_info=True)
+            stderr_lines.append(f"Spawn stderr reader failed: {type(exc).__name__}: {exc}"[:4096])
 
     try:
         stderr_task = asyncio.create_task(_read_stderr())
@@ -371,20 +355,10 @@ async def _run_subprocess(
             duration,
             timeout_seconds,
         )
-        try:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Agent '%s' (run_id=%s) didn't stop after SIGTERM, sending SIGKILL...",
-                    agent_name,
-                    run_id,
-                )
-                process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            pass
+        tree = _background_process_trees.pop(run_id)
+        await asyncio.to_thread(tree.terminate)
+        await process.wait()
+        _background_processes.pop(run_id, None)
 
         return {
             "status": "timeout",
@@ -394,7 +368,15 @@ async def _run_subprocess(
             "metadata": {"duration_seconds": round(duration, 1)},
         }
 
+    finally:
+        # A cancelled reader must not publish late IDLE events after explicit
+        # cancellation, or remain attached to a shutdown-detached worker.
+        if not stderr_task.done():
+            stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+
     _background_processes.pop(run_id, None)
+    _background_process_trees.pop(run_id, None)
 
     duration = time.time() - start_time
 
@@ -744,21 +726,23 @@ async def _resume_on_inbox_claimed(
     if not agent_name or not registry:
         logger.warning(
             "[AUTO-RESUME] Skipped %r: missing agent_name=%r or registry=%r",
-            agent_name, agent_name, bool(registry),
+            agent_name,
+            agent_name,
+            bool(registry),
         )
         return
 
     record = registry.get(run_id) if run_id else None
-    resume_session_id = (
-        (env_vars or {}).get("TEAM_SESSION_ID", "")
-        or (record.session_id if record else "")
+    resume_session_id = (env_vars or {}).get("TEAM_SESSION_ID", "") or (
+        record.session_id if record else ""
     )
     if record and resume_session_id and record.session_id != resume_session_id:
         raise ValueError("Auto-resume session does not match the spawn record")
 
     # Guard within the owning session; another team may reuse the same name.
     if registry.has_running_resume(
-        agent_name, resume_session_id,
+        agent_name,
+        resume_session_id,
         verify_process=bool(resume_session_id),
     ):
         logger.info(
@@ -786,6 +770,7 @@ async def _resume_on_inbox_claimed(
     # (no session segment) → 0 unread → silent exit → no respawn → the
     # meeting waited on ``Adrian [BA]`` forever.
     from pathlib import Path
+
     messages_dir: Path | None = None
     record = registry.get(run_id) if run_id else None
 
@@ -810,7 +795,8 @@ async def _resume_on_inbox_claimed(
                 logger.warning(
                     "[AUTO-RESUME] %s: TEAM_MESSAGES_DIR=%r is set but path "
                     "does not exist — trying session_id-derived path next",
-                    agent_name, explicit,
+                    agent_name,
+                    explicit,
                 )
 
     # 2. Canonical derivation from record.session_id + project_dir. This is
@@ -846,6 +832,7 @@ async def _resume_on_inbox_claimed(
             for line in ctx.split("\n"):
                 if "Shared Workspace" in line or "workspaces/" in line:
                     import re
+
                     match = re.search(r"(/\S+workspaces/\S+)", line)
                     if match:
                         workspace_dir = match.group(1)
@@ -854,7 +841,8 @@ async def _resume_on_inbox_claimed(
                             "context-text regex (%r) — structured env_vars "
                             "and session_id both missing. Spawn record may "
                             "be from a legacy code path; consider re-spawning.",
-                            agent_name, workspace_dir,
+                            agent_name,
+                            workspace_dir,
                         )
                         break
 
@@ -863,7 +851,8 @@ async def _resume_on_inbox_claimed(
                 "[AUTO-RESUME] %s: no TEAM_MESSAGES_DIR (param or stored), "
                 "no session_id-derived path, no TEAM_WORKSPACE, no workspace "
                 "in original_config.context — cannot locate inbox to check. "
-                "Agent will NOT be respawned.", agent_name,
+                "Agent will NOT be respawned.",
+                agent_name,
             )
             return
 
@@ -879,43 +868,35 @@ async def _resume_on_inbox_claimed(
             "[AUTO-RESUME] %s: resolved messages_dir=%r does not exist — "
             "agent will NOT be respawned (likely env_vars stale or workspace "
             "moved). Verify TEAM_MESSAGES_DIR in spawn_registry.original_config.",
-            agent_name, str(messages_dir) if messages_dir else None,
+            agent_name,
+            str(messages_dir) if messages_dir else None,
         )
         return
 
     from fast_agent.spawn.message_bus import MessageBus
+
     bus = MessageBus(messages_dir=str(messages_dir))
     unread = bus.read_unread(agent_name)
 
     if not unread:
         logger.info(
             "[AUTO-RESUME] %s: 0 unread messages at %s — nothing to resume for",
-            agent_name, str(messages_dir),
+            agent_name,
+            str(messages_dir),
         )
         return
 
     logger.info(
         "📬 %s has %d unread message(s) — auto-resuming",
-        agent_name, len(unread),
+        agent_name,
+        len(unread),
     )
 
-    # Format inbox messages as follow-up task
-    inbox_lines = [f"## New Messages ({len(unread)} unread)\n"]
-    for msg in unread:
-        inbox_lines.append(
-            f"### From {msg.from_name} [{msg.message_type}] (id: {msg.message_id})\n"
-            f"{msg.content}\n"
-        )
-    inbox_lines.append(
-        "\n## Instructions\n"
-        "You have new messages. Follow these steps:\n"
-        "1. Read ALL messages above to understand the overall situation\n"
-        "2. Prioritize: bugs > tasks > questions > responses\n"
-        "3. For each message: take action if needed, then reply using "
-        "`reply_to_message(to=sender, message=your_response, original_message_id=id)`\n"
-        "4. When all messages are handled, finish your work"
-    )
-    follow_up = "\n".join(inbox_lines)
+    from fast_agent.spawn.inbox_delivery import format_inbox_text, needs_attention
+
+    if not any(needs_attention(message) for message in unread):
+        return  # FYI remains durable; consume it with the next actionable turn.
+    follow_up = format_inbox_text(unread)
 
     # Resume the agent
     record = registry.get(run_id)
@@ -925,33 +906,54 @@ async def _resume_on_inbox_claimed(
     cfg = record.original_config
     prev_result = record.result or ""
 
-    # Find previous session history for native FastAgent resume
+    # Jarvis snapshots are authoritative; workspace files may predate compaction.
     workspace_dir = cfg.get("workspace_dir", "")
-    history_file = _find_latest_history(workspace_dir) if workspace_dir else None
+    database_path = (env_vars or {}).get("SPAWN_REGISTRY_DB") or os.environ.get(
+        "SPAWN_REGISTRY_DB"
+    )
+    history_file = None
+    if database_path:
+        from fast_agent.spawn.context_snapshot_store import materialize_resume_history
 
-    if history_file:
-        # History file found — agent will get full conversation via
-        # load_history_into_agent(). Resume task is just the new messages.
+        snapshot_session_id = (cfg.get("env_vars") or {}).get("TEAM_SESSION_ID") or record.session_id
+        try:
+            history_file = materialize_resume_history(
+                agent_name, session_id=snapshot_session_id, db_path=database_path
+            )
+        except (ValueError, OSError):
+            logger.exception("[AUTO-RESUME] %s: history restoration blocked; inbox retained", agent_name)
+            return
         enriched_context = follow_up
-        logger.info(
-            "📂 Found previous history for %s: %s", agent_name, history_file,
-        )
     else:
-        # No history file — fall back to text-based context
-        enriched_parts: list[str] = []
-        original_task = cfg.get("task", "")
-        if original_task:
-            enriched_parts.append(f"## Your Original Task\n{original_task}")
-        original_context = cfg.get("context", "")
-        if original_context:
-            enriched_parts.append(f"## Project Context\n{original_context}")
-        if prev_result:
-            enriched_parts.append(f"## Your Previous Work Summary\n{prev_result}")
-        enriched_parts.append(follow_up)
-        enriched_context = "\n\n".join(enriched_parts)
-        logger.info(
-            "⚠️ No history file for %s — using text-based context", agent_name,
-        )
+        history_file = _find_latest_history(workspace_dir) if workspace_dir else None
+
+        if history_file:
+            # History file found — agent will get full conversation via
+            # load_history_into_agent(). Resume task is just the new messages.
+            enriched_context = follow_up
+            logger.info(
+                "📂 Found previous history for %s: %s",
+                agent_name,
+                history_file,
+            )
+        else:
+            # No history file — fall back to text-based context
+            enriched_parts: list[str] = []
+            original_task = cfg.get("task", "")
+            if original_task:
+                enriched_parts.append(f"## Your Original Task\n{original_task}")
+            original_context = cfg.get("context", "")
+            if original_context:
+                enriched_parts.append(f"## Project Context\n{original_context}")
+            if prev_result:
+                enriched_parts.append(f"## Your Previous Work Summary\n{prev_result}")
+            enriched_parts.append(follow_up)
+            enriched_context = "\n\n".join(enriched_parts)
+            logger.info(
+                "⚠️ No history file for %s — using text-based context",
+                agent_name,
+            )
+
 
     # Determine correct project_dir from original_config (fixes Unknown MCP servers)
     project_dir = cfg.get("project_dir", "")
@@ -965,6 +967,7 @@ async def _resume_on_inbox_claimed(
     if team_session_id:
         try:
             from fast_agent.spawn.team_spawner import get_team_session
+
             session = get_team_session(team_session_id)
             if session:
                 role = cfg.get("role", "")
@@ -972,7 +975,8 @@ async def _resume_on_inbox_claimed(
                 enriched_context = roster_ctx + "\n\n" + enriched_context
                 logger.info(
                     "📋 Re-injected team context for %s (session %s)",
-                    agent_name, team_session_id,
+                    agent_name,
+                    team_session_id,
                 )
         except Exception as e:
             logger.warning("Failed to re-inject team context: %s", e)
@@ -996,28 +1000,24 @@ async def _resume_on_inbox_claimed(
     #     team_sessions[session_id].team_name (the canonical SSoT). This both
     #     stops new drift AND recovers records already mid-drift.
     env_vars_cfg = cfg.get("env_vars") or {}
-    resume_session_id = (
-        env_vars_cfg.get("TEAM_SESSION_ID", "")
-        or (record.session_id if record else "")
+    resume_session_id = env_vars_cfg.get("TEAM_SESSION_ID", "") or (
+        record.session_id if record else ""
     )
-    resume_team_name = (
-        cfg.get("team_name", "")
-        or (record.team_name if record else "")
-    )
+    resume_team_name = cfg.get("team_name", "") or (record.team_name if record else "")
     resume_server_overrides = cfg.get("server_overrides") or None
     resume_workspace_dir = cfg.get("workspace_dir") or None
-    if resume_session_id and (
-        not resume_team_name or not resume_server_overrides
-    ):
+    if resume_session_id and (not resume_team_name or not resume_server_overrides):
         try:
             from fast_agent.spawn.team_spawner import get_team_session
+
             sess = get_team_session(resume_session_id)
             if sess:
                 if not resume_team_name and sess.team_name:
                     resume_team_name = sess.team_name
                     logger.info(
                         "[AUTO-RESUME] %s: recovered team_name=%r via team_sessions DB lookup",
-                        agent_name, resume_team_name,
+                        agent_name,
+                        resume_team_name,
                     )
                 # server_overrides SSoT lives in team_sessions.template.roles[<role>]
                 # — restore from there if cfg lost it through the cascade.
@@ -1030,19 +1030,22 @@ async def _resume_on_inbox_claimed(
                         resume_server_overrides = role_overrides
                         logger.info(
                             "[AUTO-RESUME] %s: recovered server_overrides for role=%r via team_sessions DB lookup",
-                            agent_name, role_key,
+                            agent_name,
+                            role_key,
                         )
                 # workspace_dir SSoT is the team session's workspace path.
                 if not resume_workspace_dir and getattr(sess, "workspace", None):
                     resume_workspace_dir = str(sess.workspace)
                     logger.info(
                         "[AUTO-RESUME] %s: recovered workspace_dir=%r via team_sessions DB lookup",
-                        agent_name, resume_workspace_dir,
+                        agent_name,
+                        resume_workspace_dir,
                     )
         except Exception as e:
             logger.warning(
                 "[AUTO-RESUME] %s: team DB recovery failed: %s",
-                agent_name, e,
+                agent_name,
+                e,
             )
     if not resume_session_id or not resume_team_name:
         # Log loud — without these the new run is invisible to the bridge's
@@ -1051,7 +1054,9 @@ async def _resume_on_inbox_claimed(
             "[AUTO-RESUME] %s: missing session_id=%r or team_name=%r after "
             "recovery — spawn_progress_bridge filtering will fail. "
             "Investigate the original spawn record.",
-            agent_name, resume_session_id, resume_team_name,
+            agent_name,
+            resume_session_id,
+            resume_team_name,
         )
 
     handoff_env_vars = dict(env_vars or {})
@@ -1099,14 +1104,20 @@ async def _resume_on_inbox_claimed(
     if spawn_lifecycle_hooks:
         await _safe_hook(
             spawn_lifecycle_hooks.on_auto_resume(
-                run_id, agent_name, new_run_id, "inbox_messages",
+                run_id,
+                agent_name,
+                new_run_id,
+                "inbox_messages",
             ),
-            "on_auto_resume", run_id,
+            "on_auto_resume",
+            run_id,
         )
 
     logger.info(
         "📬 %s auto-resumed as %s to process %d message(s)",
-        agent_name, new_run_id, len(unread),
+        agent_name,
+        new_run_id,
+        len(unread),
     )
 
 
@@ -1241,12 +1252,14 @@ async def run_isolated_agent_background(
                 else:
                     status_enum = SpawnStatus.COMPLETED
 
-                registry.update_status(
+                updated_record = registry.update_status(
                     run_id,
                     status_enum,
                     result=result.get("result", ""),
                     error=result.get("error", ""),
                 )
+                if updated_record and updated_record.status == SpawnStatus.CANCELLED.value:
+                    return  # A remote controller cancelled this run; no wake/report.
 
             # Retry durable unread messages on the next explicit wake/startup
             # reconciliation after a child failure. Immediate auto-resume on
@@ -1333,14 +1346,14 @@ async def run_isolated_agent_background(
                 except Exception as e:
                     logger.warning("Failed to push team report: %s", e)
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if registry:
                 from fast_agent.spawn.spawn_registry import SpawnStatus
 
-                if lifecycle == "resumable":
-                    # Resumable agents go IDLE on server shutdown — process
-                    # stays alive and can be adopted on next startup.
-                    # Context is preserved via session history files.
+                if lifecycle == "resumable" and cancellation.args != (_EXPLICIT_CANCEL,):
+                    # Server shutdown keeps resumable history available for
+                    # adoption/restart. Explicit user cancellation must remain
+                    # terminal instead of being treated as shutdown detach.
                     registry.update_status(run_id, SpawnStatus.IDLE)
                     logger.info(
                         "Background spawn %s detached (resumable → idle)", run_id,
@@ -1371,6 +1384,7 @@ async def cancel_spawn(
     """Cancel a background spawn by run_id."""
     cancelled = False
     agent_name = ""
+    record = None
 
     # Resolve agent_name from registry before cancelling
     if registry:
@@ -1378,24 +1392,31 @@ async def cancel_spawn(
         if record:
             agent_name = getattr(record, "agent_name", "") or ""
 
-    proc = _background_processes.pop(run_id, None)
-    if proc and proc.returncode is None:
-        try:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            cancelled = True
-            logger.info("Subprocess for %s terminated", run_id)
-        except ProcessLookupError:
-            pass
-
+    # Cancel the control task first, with an explicit reason. Otherwise its
+    # resumable-shutdown handler overwrites CANCELLED with IDLE after return.
     task_obj = _background_tasks.pop(run_id, None)
     if task_obj and not task_obj.done():
-        task_obj.cancel()
+        task_obj.cancel(_EXPLICIT_CANCEL)
+        await asyncio.gather(task_obj, return_exceptions=True)
         cancelled = True
+
+    proc = _background_processes.get(run_id)
+    if proc:
+        tree = _background_process_trees.get(run_id)
+        if tree is None and proc.returncode is None:
+            tree = SpawnProcessTree(proc.pid)
+        if tree is not None:
+            await asyncio.to_thread(tree.terminate)
+            cancelled = True
+        await asyncio.wait_for(proc.wait(), timeout=3)
+        _background_processes.pop(run_id, None)
+        _background_process_trees.pop(run_id, None)
+    elif registry:
+        # UI resume is owned by the backend, not this MCP's task dictionary.
+        tree = registered_process_tree(record, run_id)
+        if tree is not None:
+            await asyncio.to_thread(tree.terminate)
+            cancelled = True
 
     if cancelled and registry:
         from fast_agent.spawn.spawn_registry import SpawnStatus
@@ -1421,33 +1442,20 @@ def cleanup_all_spawns() -> None:
 
     killed = 0
     for run_id, proc in list(_background_processes.items()):
-        if proc.returncode is None:  # Still running
-            try:
-                proc.terminate()
+        try:
+            tree = _background_process_trees.get(run_id)
+            if tree is None and proc.returncode is None:
+                tree = SpawnProcessTree(proc.pid)
+            if tree is not None:
+                tree.terminate()
                 killed += 1
-                logger.info("Terminated spawned agent %s (pid=%s)", run_id, proc.pid)
-            except ProcessLookupError:
-                pass
+        except (ProcessLookupError, RuntimeError) as error:
+            logger.error("Spawn cleanup failed for %s: %s", run_id, error, exc_info=True)
 
-    # Cancel asyncio tasks
-    for run_id, task_obj in list(_background_tasks.items()):
+    for task_obj in list(_background_tasks.values()):
         if not task_obj.done():
             task_obj.cancel()
-
-    if killed:
-        # Give processes a moment to exit gracefully
-        import time as _time
-        _time.sleep(1)
-
-        # Force-kill any survivors
-        for run_id, proc in list(_background_processes.items()):
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                    logger.warning("Force-killed spawned agent %s (pid=%s)", run_id, proc.pid)
-                except ProcessLookupError:
-                    pass
-
     _background_processes.clear()
+    _background_process_trees.clear()
     _background_tasks.clear()
-    logger.info("Spawn cleanup complete (%d processes terminated)", killed)
+    logger.info("Spawn cleanup complete (%d process trees terminated)", killed)

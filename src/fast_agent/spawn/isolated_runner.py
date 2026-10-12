@@ -68,6 +68,8 @@ async def _send_pending_and_ack(
     trigger: str,
     bus: Any,
     message_ids: list[str],
+    *,
+    team_name: str = "",
 ) -> Any:
     """Commit inbox delivery only after the agent turn has succeeded.
 
@@ -76,7 +78,7 @@ async def _send_pending_and_ack(
     replay a turn; delivery is at least once rather than silently lost.
     """
     response = await agent.send(pending)
-    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger)
+    await _save_agent_context_snapshot(agent, run_id, agent_name, trigger, team_name=team_name)
     if bus is not None:
         for message_id in message_ids:
             bus.mark_done(agent_name, message_id)
@@ -468,12 +470,13 @@ def create_child_config(
     return temp_dir
 
 
-
 async def _save_agent_context_snapshot(
     agent: Any,
     run_id: str,
     agent_name: str,
     trigger: str,
+    *,
+    team_name: str = "",
 ) -> None:
     """Save agent context window to SQLite — never raises.
 
@@ -511,7 +514,7 @@ async def _save_agent_context_snapshot(
             trigger=trigger,
             agent_name=agent_name,
             session_id=_os.environ.get("TEAM_SESSION_ID"),
-            team_name=_os.environ.get("TEAM_MY_ROLE", ""),
+            team_name=team_name,
         )
     except Exception as _ctx_exc:
         import sys as _sys
@@ -612,7 +615,12 @@ async def run_child_agent(
         # Convert skill names to SkillManifest objects using shared helper
         skills_dir = Path(project_dir) / ".fast-agent" / "skills"
         skill_manifests = get_skills(skills_dir, *skill_names) if skill_names else []
-        logger.info("[SKILLS DEBUG] role=%s, skill_names=%s, manifests=%d", role, skill_names, len(skill_manifests))
+        logger.info(
+            "[SKILLS DEBUG] role=%s, skill_names=%s, manifests=%d",
+            role,
+            skill_names,
+            len(skill_manifests),
+        )
         logger.info(
             "[SKILLS DEBUG] instruction has {agentSkills}: %s",
             "{agentSkills}" in full_instruction,
@@ -651,10 +659,40 @@ async def run_child_agent(
                 # (no backend) just skips it.
                 try:
                     from services.context_compaction import attach_compaction_hooks_to_all
-                    if attach_compaction_hooks_to_all(agent):
-                        logger.info("[COMPACT] compaction hook attached to spawned agent %s", agent_name)
+
+                    if attach_compaction_hooks_to_all(
+                        agent, run_id=event_run_id,
+                        session_id=os.environ.get("TEAM_SESSION_ID"),
+                        team_name=config.get("team_name"),
+                    ):
+                        logger.info(
+                            "[COMPACT] compaction hook attached to spawned agent %s", agent_name
+                        )
                 except Exception:
-                    logger.debug("[COMPACT] compaction unavailable in spawned process", exc_info=True)
+                    logger.debug(
+                        "[COMPACT] compaction unavailable in spawned process", exc_info=True
+                    )
+
+                try:
+                    from services.memory.spawn_hooks import attach_spawn_memory_hooks
+
+                    attach_spawn_memory_hooks(agent)
+                except ImportError:
+                    logger.debug("[MEMORY] Jarvis memory bridge unavailable")
+
+                if os.environ.get("TEAM_WORKSPACE"):
+                    from fast_agent.spawn.workspace_write_guard import create_workspace_write_hooks
+
+                    try:
+                        from services.sse_progress import merge_hooks
+
+                        child = agent[agent_name]
+                        child.tool_runner_hooks = merge_hooks(
+                            child.tool_runner_hooks,
+                            create_workspace_write_hooks(Path(workspace_dir), agent_name),
+                        )
+                    except ImportError:
+                        logger.debug("[WORKSPACE] Jarvis hook merger unavailable")
 
                 # Signal that agent is ready (MCP servers loaded, hooks installed)
                 emit_event("agent_ready", event_run_id, agent_name)
@@ -665,22 +703,11 @@ async def run_child_agent(
                 # If resuming, load previous session history into agent
                 # This uses FastAgent's native API — no LLM call, just
                 # restores message_history so the next send() has full context
-                if history_file and Path(history_file).exists():
-                    from fast_agent.mcp.prompts.prompt_load import (
-                        load_history_into_agent,
-                    )
+                if history_file:
+                    from fast_agent.spawn.resume_history import restore_history
 
-                    try:
-                        load_history_into_agent(agent[agent_name], Path(history_file))
-                        logger.info(
-                            "📂 Loaded previous history from %s",
-                            history_file,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "⚠️ Failed to load history: %s — continuing fresh",
-                            exc,
-                        )
+                    restore_history(agent[agent_name], Path(history_file))
+                    logger.info("Loaded previous history from %s", history_file)
 
                 # ── Unified inbox-driven lifetime loop ──
                 # The agent's lifetime is a single loop over a persistent
@@ -742,12 +769,25 @@ async def run_child_agent(
 
                     logger.info(
                         "📡 %s entering keep-alive mode (timeout=%.1fs)",
-                        agent_name, KEEP_ALIVE_TIMEOUT_S,
+                        agent_name,
+                        KEEP_ALIVE_TIMEOUT_S,
                     )
 
                 # Initial task is the first "pending" item. After it runs,
                 # subsequent iterations drain the inbox.
-                pending: str | None = task
+                from fast_agent.spawn.inbox_delivery import build_inbox_prompt, needs_attention
+
+                handoff_ids = set(json.loads(os.environ.get("TEAM_HANDOFF_MESSAGE_IDS", "[]")))
+                handoff = (
+                    [
+                        message
+                        for message in bus.read_unread(agent_name)
+                        if message.message_id in handoff_ids
+                    ]
+                    if bus
+                    else []
+                )
+                pending = build_inbox_prompt(handoff, text=task) if handoff else task
                 pending_msg_count = 0
                 pending_message_ids: list[str] = []
                 is_first_iter = True
@@ -775,13 +815,16 @@ async def run_child_agent(
                                     "task_complete" if is_first_iter else "idle",
                                     bus,
                                     pending_message_ids,
+                                    team_name=team_name,
                                 )
                             except Exception as _send_exc:
                                 import sys
                                 import traceback
+
                                 logger.error(
                                     "[AGENT.SEND CRASH] agent=%s error=%s",
-                                    agent_name, _send_exc,
+                                    agent_name,
+                                    _send_exc,
                                 )
                                 traceback.print_exc(file=sys.stderr)
                                 sys.stderr.flush()
@@ -807,7 +850,7 @@ async def run_child_agent(
                         # messages that arrived during agent.send (when sock
                         # was not yet listening), and post-wake messages.
                         unread = bus.read_unread(agent_name) if bus else []
-                        if unread:
+                        if unread and any(needs_attention(message) for message in unread):
                             # If we got here via timeout (not signal), the
                             # producer's wake signal was lost — surface so
                             # ops can investigate. Inbox-poll fallback
@@ -818,23 +861,12 @@ async def run_child_agent(
                                     "inbox-poll fallback recovered after 30s. "
                                     "Producer likely crashed mid-send, skipped "
                                     "auto_wake_if_idle, or signal delivery failed.",
-                                    agent_name, len(unread),
+                                    agent_name,
+                                    len(unread),
                                 )
                             last_was_timeout = False
 
-                            inbox_lines = [
-                                f"\n━━━ 📬 NEW MESSAGES ({len(unread)} unread) ━━━\n"
-                            ]
-                            for msg in unread:
-                                inbox_lines.append(
-                                    f"[{msg.message_type.upper()}] from {msg.from_name}:\n"
-                                    f"  {msg.content}\n"
-                                )
-                            inbox_lines.append(
-                                "→ Handle these messages: take action and/or reply.\n"
-                                "━━━━━━━━━━━━━━━━━━━━\n"
-                            )
-                            pending = "\n".join(inbox_lines)
+                            pending = build_inbox_prompt(unread)
                             pending_msg_count = len(unread)
                             pending_message_ids = [msg.message_id for msg in unread]
                             continue
@@ -847,11 +879,12 @@ async def run_child_agent(
                         # call auto_wake). Loop returns to step 3 on
                         # either signal or timeout.
                         signal = await channel.listen(timeout=KEEP_ALIVE_TIMEOUT_S)
-                        last_was_timeout = (signal is None)
+                        last_was_timeout = signal is None
                         if signal:
                             logger.info(
                                 "📬 %s woke up on signal '%s'",
-                                agent_name, signal,
+                                agent_name,
+                                signal,
                             )
                 finally:
                     if channel is not None:
@@ -902,6 +935,7 @@ async def run_child_agent(
             pass
 
     return result
+
 
 # ── Runtime config emission ────────────────────────────────────────
 

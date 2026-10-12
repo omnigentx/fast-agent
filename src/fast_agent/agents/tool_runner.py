@@ -26,6 +26,7 @@ from fast_agent.constants import (
     FAST_AGENT_TIMING,
     FAST_AGENT_USAGE,
 )
+from fast_agent.core.exceptions import RecoverableToolError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import MessageHistoryAgentProtocol, TurnCancellationStateCapable
 from fast_agent.llm.request_params import tool_result_mode_is_passthrough
@@ -723,6 +724,21 @@ class ToolRunner:
             )
         except asyncio.CancelledError:
             raise
+        except RecoverableToolError as exc:
+            if hook_phase == "before_tool_call":
+                tool_message = PromptMessageExtended(
+                    role="user",
+                    tool_results={
+                        tool_id: CallToolResult(content=[text_content(str(exc))], isError=True)
+                        for tool_id in (self._pending_tool_request.tool_calls or {})
+                    },
+                )
+            else:
+                tool_message = self._build_tool_error_response(
+                    self._pending_tool_request,
+                    f"Tool execution failed during {hook_phase}: {exc}",
+                )
+                _logger.exception("Tool execution failed", hook_phase=hook_phase)
         except Exception as exc:
             tool_calls = self._pending_tool_request.tool_calls or {}
             tool_call_ids = list(tool_calls.keys())
